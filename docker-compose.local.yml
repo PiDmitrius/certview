@@ -1,0 +1,4 @@
+volumes:
+  certview-data:
+    external: true
+    name: ${CERTVIEW_DATA_VOLUME:-certview-data}
