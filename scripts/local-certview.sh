@@ -43,6 +43,26 @@ export CERTVIEW_HTTP_BIND="$HTTP_BIND"
 export CERTVIEW_ADMIN_BIND="$ADMIN_BIND"
 export CERTVIEW_DATA_VOLUME="$DATA_VOLUME"
 
+bump_version() {
+  if [[ "${SKIP_VERSION_BUMP:-0}" == "1" ]]; then
+    echo "version bump skipped (SKIP_VERSION_BUMP=1)"
+    return 0
+  fi
+  local file="$ROOT/VERSION"
+  local version major minor patch
+  version="$(tr -d '[:space:]' < "$file")"
+  if [[ ! "$version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+    echo "bad VERSION: $version" >&2
+    return 1
+  fi
+  major="${BASH_REMATCH[1]}"
+  minor="${BASH_REMATCH[2]}"
+  patch="${BASH_REMATCH[3]}"
+  patch=$((patch + 1))
+  printf '%s.%s.%s\n' "$major" "$minor" "$patch" > "$file"
+  echo "version: $version -> $major.$minor.$patch"
+}
+
 compose() {
   docker compose \
     -p "$PROJECT" \
@@ -137,6 +157,7 @@ ensure_data_volume_owner() {
 }
 
 up() {
+  bump_version
   build_certget
   build_certview
 
