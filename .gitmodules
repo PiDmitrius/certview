@@ -1,0 +1,3 @@
+[submodule "minipki"]
+	path = minipki
+	url = https://github.com/PiDmitrius/MiniPKI.git

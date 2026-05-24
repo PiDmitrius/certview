@@ -1,0 +1,1542 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CertView</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M8 1 L14 3 V8 Q14 12 8 15 Q2 12 2 8 V3 Z' fill='%230366d6'/%3E%3Cpath d='M5 8 L7 10 L11 6' stroke='%23fff' stroke-width='2' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<style>
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+:root {
+  --bg: #f6f8fa;
+  --surface: #ffffff;
+  --border: #d0d7de;
+  --text: #24292e;
+  --text2: #6a737d;
+  --accent: #0366d6;
+  --green: #1a7f37;
+  --red: #d73a49;
+  --yellow: #9a6700;
+  --mono: 'SF Mono', 'Cascadia Code', 'Fira Code', Consolas, monospace;
+}
+
+html {
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+
+body {
+  font-family: var(--mono);
+  font-size: 13px;
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+}
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 5px;
+  border: 2px solid var(--bg);
+}
+::-webkit-scrollbar-thumb:hover { background: var(--text2); }
+
+header {
+  padding: 24px 32px 0;
+}
+
+header h1 a {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--accent);
+  text-decoration: none;
+}
+header h1 a:hover { opacity: 0.85; }
+
+header p {
+  color: var(--text2);
+  margin-top: 4px;
+  font-size: 12px;
+}
+
+main {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 24px 32px;
+}
+
+#drop-zone {
+  border: 2px dashed var(--border);
+  border-radius: 8px;
+  padding: 8px 14px;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color 0.2s, background 0.2s;
+  color: var(--text2);
+  height: 64px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
+
+#drop-zone.hover {
+  border-color: var(--accent);
+  background: #f0f6ff;
+}
+
+#drop-zone input[type="file"] {
+  display: none;
+}
+
+#drop-zone .label {
+  font-size: 13px;
+  margin-bottom: 3px;
+}
+
+#drop-zone .hint {
+  font-size: 11px;
+}
+
+.pem-area {
+  margin-top: 12px;
+  display: flex;
+  gap: 8px;
+}
+
+.pem-area textarea {
+  flex: 1;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 10px;
+  resize: vertical;
+  min-height: 60px;
+}
+
+.pem-area textarea::placeholder { color: var(--text2); }
+
+.pem-area button {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 0 20px;
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.pem-area button:hover { opacity: 0.85; }
+
+#loading {
+  display: none;
+  text-align: center;
+  padding: 32px;
+  color: var(--text2);
+}
+
+#loading.active { display: block; }
+
+#results {
+  display: none;
+  margin-top: 24px;
+}
+
+#results.active { display: block; }
+
+.section {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  margin-bottom: 16px;
+}
+
+.section h2 {
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 12px;
+  color: var(--accent);
+}
+
+.verify-badge {
+  display: inline-block;
+  padding: 4px 12px;
+  border-radius: 4px;
+  font-weight: 600;
+  font-size: 12px;
+}
+
+.verify-badge.ok { background: #dcffe4; color: var(--green); }
+.verify-badge.error { background: #ffebe9; color: var(--red); }
+.verify-badge.warn { background: #fff8c5; color: var(--yellow); }
+.verify-badge.neutral { background: #eaeef2; color: var(--text2); }
+
+.chain-node {
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin-bottom: 4px;
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+
+.chain-node:hover { border-color: var(--accent); }
+.chain-node.selected { border-color: var(--accent); background: #f0f6ff; }
+.chain-node.selected .cn-meta { color: var(--accent); }
+.chain-node.selected .cn-san { color: var(--accent); }
+
+.chain-node .cn-tags {
+  margin-bottom: 4px;
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.chain-node .cn-subject {
+  font-weight: 600;
+  font-size: 12px;
+}
+
+.chain-node .cn-san {
+  color: var(--text);
+  font-size: 11px;
+  margin-top: 3px;
+  font-weight: 500;
+}
+
+.chain-node .cn-meta {
+  color: var(--text2);
+  font-size: 11px;
+  margin-top: 2px;
+}
+
+.crl-inline {
+  margin: 8px -12px -10px;
+  padding: 8px 10px;
+  background: #f6f8fa;
+  border-radius: 0 0 6px 6px;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--text2);
+  cursor: pointer;
+  transition: color 0.15s, background 0.15s;
+}
+
+.crl-inline:hover { color: var(--text); background: #f0f6ff; }
+.crl-inline.selected { color: var(--accent); background: #ddf4ff; }
+.crl-inline .cn-tags { margin-bottom: 4px; display: flex; gap: 4px; flex-wrap: wrap; }
+.crl-inline .crl-summary { font-size: 11px; }
+
+#chain-tree { padding-left: 0; }
+
+.chain-node {
+  position: relative;
+  margin-bottom: 0;
+}
+
+.chain-node + .chain-node {
+  margin-top: 14px;
+}
+
+.chain-node + .chain-node::before {
+  content: '';
+  position: absolute;
+  top: -15px;
+  left: 18px;
+  width: 9px;
+  height: 14px;
+  background: repeating-linear-gradient(
+    to right,
+    var(--border) 0 1px,
+    transparent 1px 4px
+  );
+}
+
+
+.cert-detail table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.cert-detail tr { border-bottom: 1px solid var(--border); }
+.cert-detail tr:last-child { border-bottom: none; }
+.cert-detail tr.row-gap td { padding-top: 12px; }
+
+.cert-detail td {
+  padding: 6px 0;
+  vertical-align: top;
+  font-size: 12px;
+}
+
+.cert-detail td:first-child {
+  color: var(--text2);
+  width: 160px;
+  min-width: 160px;
+  max-width: 160px;
+  white-space: nowrap;
+  user-select: none;
+}
+
+.cert-detail td:last-child {
+  word-break: break-all;
+}
+
+.cert-detail td:last-child:not(.detail-label) {
+  cursor: pointer;
+  position: relative;
+}
+
+.cert-detail td:last-child:not(.detail-label):hover {
+  color: var(--accent);
+}
+
+.cert-detail td:last-child:not(.detail-label).copied::after {
+  content: 'copied';
+  position: absolute;
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 10px;
+  color: var(--green);
+  pointer-events: none;
+}
+
+.cert-detail td.detail-label {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--accent);
+  padding: 16px 0 6px;
+  border: none;
+  cursor: default;
+}
+
+.cert-detail td.detail-label:hover {
+  color: var(--accent);
+}
+
+.dn-line { display: block; padding: 1px 0; }
+.dn-key { color: var(--text2); }
+.dn-eq { color: var(--text2); }
+.dn-val { color: var(--text); font-weight: 600; }
+.dn-sep { color: var(--border); }
+
+.tag {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.tag.ca { background: #ddf4ff; color: #0969da; }
+.tag.root { background: #dcffe4; color: #1a7f37; }
+.tag.leaf { background: #fff8c5; color: #9a6700; }
+.tag.cross { background: #ffe9f3; color: #bf3989; }
+.tag.eku { background: #f0e8ff; color: #6639ba; }
+.tag.algo { background: #ddf4ff; color: #0550ae; }
+.tag.bad { background: #ffebe9; color: var(--red); }
+.tag.unchecked { background: #eaeef2; color: var(--text2); }
+
+.cert-actions {
+  margin-top: 12px;
+  display: flex;
+  gap: 8px;
+}
+
+.cert-actions button {
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 4px 10px;
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s, background 0.15s;
+}
+
+.cert-actions button:hover { background: #f0f6ff; border-color: var(--accent); }
+
+.cert-actions button:hover {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+.cert-actions button.copied {
+  border-color: var(--green);
+  color: var(--green);
+}
+
+.warnings {
+  margin-top: 12px;
+}
+
+.warnings li {
+  color: var(--yellow);
+  font-size: 11px;
+  margin-bottom: 4px;
+  list-style: none;
+}
+
+.warnings li::before {
+  content: "! ";
+  font-weight: bold;
+}
+
+.crl-row {
+  font-size: 11px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.crl-row:last-child { border-bottom: none; }
+.crl-row .crl-urls { margin-top: 6px; padding-top: 4px; border-top: 1px solid var(--border); }
+.crl-row .crl-url { color: var(--text2); word-break: break-all; padding: 2px 0; font-size: 11px; }
+
+@media print {
+  body { background: #fff; }
+  #drop-zone, .pem-area, .cert-actions, header { display: none !important; }
+  .section { page-break-inside: avoid; box-shadow: none; }
+  .chain-node { page-break-inside: avoid; }
+}
+.crl-row .crl-err { color: var(--red); }
+.crl-revoked { color: var(--red); font-weight: 600; }
+
+/* Tabs live inside the Verification card, hugging the top edge: a flat row
+   with a 1-px divider that the active tab underlines in accent color. */
+.site-tabs {
+  display: flex;
+  gap: 0;
+  margin: -16px -16px 16px;
+  padding: 0 8px;
+  border-bottom: 1px solid var(--border);
+}
+.site-tab {
+  padding: 10px 16px;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--text2);
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  user-select: none;
+  transition: color 0.15s, border-color 0.15s;
+}
+.site-tab:hover { color: var(--text); }
+.site-tab.active {
+  color: var(--accent);
+  font-weight: 600;
+  border-bottom-color: var(--accent);
+}
+.site-tab.failed { color: var(--red); opacity: 0.7; }
+
+#error-box {
+  display: none;
+  margin-top: 16px;
+  border: 1px solid #ff8182;
+  background: #ffebe9;
+  color: var(--red);
+  border-radius: 6px;
+  padding: 10px 12px;
+  font-size: 12px;
+}
+
+#error-box.active { display: block; }
+#error-box .error-title { font-weight: 600; margin-bottom: 4px; }
+#error-box .error-message { color: var(--text); overflow-wrap: anywhere; }
+
+</style>
+</head>
+<body>
+<header>
+  <h1><a href="/">CertView</a></h1>
+  <p>Certificate chain analyzer</p>
+</header>
+<main>
+  <div id="drop-zone" tabindex="0">
+    <div class="label">Drop certificate or CRL file here</div>
+    <div class="hint">DER, PEM, PKCS#7 &mdash; or click to browse</div>
+    <input type="file" id="file-input" accept=".pem,.crt,.cer,.der,.p7b,.p7c,.crl">
+  </div>
+  <div class="pem-area">
+    <textarea id="pem-input" placeholder="Or paste PEM or URL here..." rows="3"></textarea>
+    <button id="pem-btn">Analyze</button>
+  </div>
+
+  <div id="loading">Analyzing certificate&hellip;</div>
+  <div id="error-box">
+    <div class="error-title"></div>
+    <div class="error-message"></div>
+  </div>
+
+  <div id="results">
+    <div class="section" id="verify-section">
+      <div class="site-tabs" id="site-tabs" style="display:none"></div>
+      <h2>Verification</h2>
+      <div id="verify-result"></div>
+    </div>
+
+    <div class="section" id="chain-section">
+      <h2>Certificate Chain</h2>
+      <div id="chain-tree"></div>
+    </div>
+
+    <div class="section" id="detail-section">
+      <div id="cert-details" class="cert-detail"></div>
+    </div>
+
+
+    <div id="warnings-section" style="display:none">
+      <ul class="warnings" id="warnings-list"></ul>
+    </div>
+  </div>
+</main>
+
+<script>
+const dropZone = document.getElementById('drop-zone');
+const fileInput = document.getElementById('file-input');
+const pemInput = document.getElementById('pem-input');
+const pemBtn = document.getElementById('pem-btn');
+const loading = document.getElementById('loading');
+const results = document.getElementById('results');
+const siteTabs = document.getElementById('site-tabs');
+const errorBox = document.getElementById('error-box');
+
+let siteEnabled = false;
+let siteData = null;
+let activeTabIdx = 0;
+
+function clearError() {
+  errorBox.classList.remove('active');
+  errorBox.querySelector('.error-title').textContent = '';
+  errorBox.querySelector('.error-message').textContent = '';
+}
+
+function showError(title, message) {
+  errorBox.querySelector('.error-title').textContent = title;
+  errorBox.querySelector('.error-message').textContent = message || '';
+  errorBox.classList.add('active');
+}
+
+function resetSiteState() {
+  siteData = null;
+  siteTabs.style.display = 'none';
+}
+
+// Heuristic: decide whether textarea content is a URL/host or PEM/binary.
+// PEM is multi-line and/or has '-----' markers; a URL/host is a short single
+// line with a scheme, dot (hostname/IPv4), or colon (IPv6/host:port).
+function looksLikeSiteInput(s) {
+  if (!s) return false;
+  if (s.includes('\n') || s.includes('-----')) return false;
+  if (s.length > 256) return false;
+  if (s.includes('://')) return true;
+  return s.includes('.') || s.includes(':');
+}
+
+dropZone.addEventListener('click', () => fileInput.click());
+
+dropZone.addEventListener('dragover', (e) => {
+  e.preventDefault();
+  dropZone.classList.add('hover');
+});
+
+dropZone.addEventListener('dragleave', () => {
+  dropZone.classList.remove('hover');
+});
+
+dropZone.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dropZone.classList.remove('hover');
+  const file = e.dataTransfer.files[0];
+  if (file) sendFile(file);
+});
+
+fileInput.addEventListener('change', () => {
+  if (fileInput.files[0]) sendFile(fileInput.files[0]);
+});
+
+pemBtn.addEventListener('click', () => {
+  const text = pemInput.value.trim();
+  if (!text) return;
+  if (siteEnabled && looksLikeSiteInput(text)) {
+    fetchSite(text);
+  } else {
+    sendBytes(new TextEncoder().encode(text));
+  }
+});
+
+async function sendFile(file) {
+  const buf = await file.arrayBuffer();
+  sendBytes(new Uint8Array(buf));
+}
+
+async function sendBytes(bytes) {
+  loading.classList.add('active');
+  results.classList.remove('active');
+  clearError();
+  clearSiteUI();
+
+  try {
+    const resp = await fetch('/api/analyze', {
+      method: 'POST',
+      body: bytes,
+    });
+    const data = await resp.json();
+    render(data);
+    updateHashFromData(data);
+  } catch (e) {
+    showError('Request failed', e.message);
+  } finally {
+    loading.classList.remove('active');
+  }
+}
+
+async function loadByThumbprint(tp) {
+  loading.classList.add('active');
+  results.classList.remove('active');
+  clearError();
+  clearSiteUI();
+  try {
+    const resp = await fetch('/api/cert/' + encodeURIComponent(tp));
+    if (!resp.ok) throw new Error('not found: ' + tp);
+    const data = await resp.json();
+    render(data);
+  } catch (e) {
+    showError('Load failed', e.message);
+  } finally {
+    loading.classList.remove('active');
+  }
+}
+
+async function fetchSite(url) {
+  loading.classList.add('active');
+  results.classList.remove('active');
+  clearError();
+  resetSiteState();
+  activeTabIdx = 0;
+  try {
+    const resp = await fetch('/api/site', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({url}),
+    });
+    if (!resp.ok) {
+      const t = await resp.text();
+      showError('Site fetch failed', t.trim());
+      return;
+    }
+    const data = await resp.json();
+    siteData = data;
+    pemInput.value = canonicalSiteString(data.host, data.port);
+    renderSite(data);
+    updateSitePath(data.host, data.port);
+  } catch (e) {
+    showError('Request failed', e.message);
+  } finally {
+    loading.classList.remove('active');
+  }
+}
+
+function canonicalSiteString(host, port) {
+  let hp = host;
+  if (host.includes(':')) hp = '[' + host + ']';
+  if (port && port !== 443) hp = hp + ':' + port;
+  return hp;
+}
+
+async function loadSiteByPath(hostport, targetThumb) {
+  loading.classList.add('active');
+  results.classList.remove('active');
+  clearError();
+  resetSiteState();
+  activeTabIdx = 0;
+  pemInput.value = hostport;
+  try {
+    const resp = await fetch('/api/site/' + encodeURIComponent(hostport));
+    if (!resp.ok) {
+      const t = await resp.text();
+      showError('Site load failed', t.trim());
+      return;
+    }
+    const data = await resp.json();
+    siteData = data;
+    if (targetThumb) {
+      const idx = data.results.findIndex(r =>
+        r.ok && r.analysis && r.analysis.chain[0] &&
+        r.analysis.chain[0].thumbprint_sha1 === targetThumb);
+      if (idx >= 0) activeTabIdx = idx;
+    }
+    renderSite(data);
+  } catch (e) {
+    showError('Request failed', e.message);
+  } finally {
+    loading.classList.remove('active');
+  }
+}
+
+function renderSite(data) {
+  results.classList.add('active');
+  // Honor an already-chosen activeTabIdx (e.g. from a #thumbprint in the URL).
+  // Otherwise pick the first ok result.
+  const current = data.results[activeTabIdx];
+  if (!current || !current.ok || !current.analysis) {
+    const okIdx = data.results.findIndex(r => r.ok && r.analysis);
+    activeTabIdx = okIdx >= 0 ? okIdx : 0;
+  }
+
+  // Show tabs only when there's a real choice: at least two ok results with
+  // different chains. If both backends got the same cert (typical for a
+  // non-GOST site where openssl-gost just falls back to the global suite),
+  // the tabs are noise — collapse to a single chain view.
+  const okSigs = new Set(
+    data.results
+      .filter(r => r.ok && r.analysis && r.analysis.chain[0])
+      .map(r => r.analysis.chain[0].thumbprint_sha1)
+  );
+  const showTabs = data.results.length > 1 && okSigs.size > 1;
+
+  if (showTabs) {
+    siteTabs.style.display = '';
+    siteTabs.innerHTML = data.results.map((r, i) => {
+      const failed = r.ok ? '' : ' failed';
+      const label = tabLabel(r, i);
+      return `<div class="site-tab${i === activeTabIdx ? ' active' : ''}${failed}" data-idx="${i}" title="${r.ok ? '' : esc(r.error||'failed')}">${esc(label)}</div>`;
+    }).join('');
+    siteTabs.querySelectorAll('.site-tab').forEach(t => {
+      t.addEventListener('click', () => {
+        const i = parseInt(t.dataset.idx, 10);
+        activeTabIdx = i;
+        siteTabs.querySelectorAll('.site-tab').forEach(x => x.classList.toggle('active', parseInt(x.dataset.idx,10) === i));
+        renderActiveSiteTab();
+      });
+    });
+  } else {
+    siteTabs.style.display = 'none';
+  }
+  renderActiveSiteTab();
+}
+
+function tabLabel(r, idx) {
+  if (idx === 0) return 'Global';
+  if (isGostResult(r)) return 'GOST';
+  return 'Secondary';
+}
+
+function isGostResult(r) {
+  return (r.cipher_suite && r.cipher_suite.includes('GOST'));
+}
+
+function renderActiveSiteTab() {
+  const r = siteData.results[activeTabIdx];
+
+  if (!r.ok || !r.analysis) {
+    document.getElementById('verify-result').innerHTML = `<span class="verify-badge error">Failed</span> <span style="color:var(--text2)">${esc(r.error||'unknown error')}</span>`;
+    document.getElementById('chain-tree').innerHTML = '';
+    document.getElementById('cert-details').innerHTML = '';
+    document.getElementById('warnings-section').style.display = 'none';
+    return;
+  }
+  render(r.analysis);
+}
+
+function updateSitePath(host, port) {
+  const newPath = '/' + canonicalSiteString(host, port);
+  if (window.location.pathname !== newPath || window.location.hash) {
+    window.history.replaceState(null, '', newPath);
+  }
+}
+
+function clearSiteUI() {
+  resetSiteState();
+  if (window.location.pathname !== '/') {
+    window.history.replaceState(null, '', '/');
+  }
+}
+
+// A pathname is a site-fetch route if it's not the root and looks like a host
+// (contains a dot or starts with '[' for IPv6).
+function pathLooksLikeHost(p) {
+  if (!p || p === '/') return false;
+  const seg = p.slice(1);
+  return seg.includes('.') || seg.startsWith('[');
+}
+
+function updateHashFromData(data) {
+  if (data && data.chain && data.chain.length > 0) {
+    const tp = data.chain[0].thumbprint_sha1;
+    if (tp) {
+      // Suppress hashchange handler
+      window.__suppressHash = true;
+      window.location.hash = tp;
+      setTimeout(() => { window.__suppressHash = false; }, 100);
+    }
+  }
+}
+
+function shareLink(btn, tp, keepSitePath) {
+  const path = keepSitePath ? window.location.pathname : '/';
+  const url = window.location.origin + path + '#' + tp;
+  copyToClipboard(url, btn, 'Link');
+}
+
+function copyCRLPEM(btn, b64) {
+  const lines = b64.match(/.{1,64}/g) || [];
+  const pem = '-----BEGIN X509 CRL-----\n' + lines.join('\n') + '\n-----END X509 CRL-----\n';
+  copyToClipboard(pem, btn, 'Copy PEM');
+}
+
+function saveOCSP(b64, name) {
+  const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+  const blob = new Blob([bytes], { type: 'application/ocsp-response' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name + '.ocsp';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+function saveCRL(b64, name) {
+  const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+  const blob = new Blob([bytes], { type: 'application/pkix-crl' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name.endsWith('.crl') ? name : name + '.crl';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+window.addEventListener('hashchange', () => {
+  if (window.__suppressHash) return;
+  const tp = window.location.hash.slice(1);
+  if (tp) loadByThumbprint(tp);
+});
+
+window.addEventListener('DOMContentLoaded', async () => {
+  try {
+    const resp = await fetch('/api/config');
+    if (resp.ok) {
+      const cfg = await resp.json();
+      siteEnabled = !!cfg.site_enabled;
+    }
+  } catch (e) {}
+
+  const path = window.location.pathname;
+  if (pathLooksLikeHost(path)) {
+    const hp = path.slice(1).replace(/\/$/, '');
+    const wantThumb = window.location.hash.slice(1) || null;
+    loadSiteByPath(hp, wantThumb);
+    return;
+  }
+
+  const tp = window.location.hash.slice(1);
+  if (tp) loadByThumbprint(tp);
+});
+
+function render(data) {
+  results.classList.add('active');
+  clearError();
+  window.__isAdmin = data.is_admin || false;
+  window.__lastData = data;
+  const chain = data.chain || [];
+
+  // Verification
+  const vr = data.verify || {};
+  const verifyEl = document.getElementById('verify-result');
+  let cls = 'error';
+  if (vr.status === 'ok') cls = 'ok';
+  else if (vr.status === 'no_crl' || vr.status === 'no_chain') cls = 'warn';
+  let label = vr.status === 'ok' ? 'Valid' : (vr.message || vr.status);
+  let html = `<span class="verify-badge ${cls}">${esc(label)}</span>`;
+  const cryptoBadge = chainCryptoBadge(chain);
+  if (cryptoBadge) {
+    html += ` <span class="verify-badge ${cryptoBadge.cls}" title="${esc(cryptoBadge.title)}">${esc(cryptoBadge.label)}</span>`;
+  }
+  if (vr.trusted) {
+    html += ` <span class="verify-badge ok" title="Chain reaches a trusted root: ${esc(vr.trust_via||'')}">Trusted</span>`;
+  } else if (vr.status === 'ok' || vr.status === 'warn') {
+    html += ` <span class="verify-badge warn" title="Chain built but root is not in trust store">Untrusted root</span>`;
+  }
+  if (vr.revocation_status === 'checked') {
+    html += ` <span class="verify-badge ok" title="All CRLs fetched, no certs revoked">Revocation checked</span>`;
+  } else if (vr.revocation_status === 'incomplete') {
+    html += ` <span class="verify-badge warn" title="${esc(vr.revocation_msg||'')}">Revocation unknown</span>`;
+  } else if (vr.revocation_status === 'na') {
+    html += ` <span class="verify-badge neutral" title="${esc(vr.revocation_msg||'')}">Revocation N/A</span>`;
+  }
+  verifyEl.innerHTML = html;
+
+  // Chain
+  const chainEl = document.getElementById('chain-tree');
+  chainEl.innerHTML = '';
+  chain.forEach((cert, i) => {
+    const node = document.createElement('div');
+    node.className = 'chain-node' + (i === 0 ? ' selected' : '');
+    let tags = '';
+    if (i === 0) tags += '<span class="tag leaf">LEAF</span> ';
+    if (cert.is_ca) tags += '<span class="tag ca">CA</span> ';
+    if (cert.is_self_signed) tags += '<span class="tag root">ROOT</span> ';
+    if (cert.is_cross_signed) tags += '<span class="tag cross" title="Cross-signed: signed by another CA with the same name">CROSS</span> ';
+    if (cert.trusted) tags += '<span class="tag root" title="In trust store">TRUSTED</span> ';
+    tags += algoTag(cert) + ' ';
+    if (cert.ekus) cert.ekus.forEach(e => { tags += ekuTag(e) + ' '; });
+    // Trust only makes PKI sense for self-signed roots
+    const adminBtn = (window.__isAdmin && cert.is_self_signed)
+      ? `<button onclick="event.stopPropagation(); toggleTrust(this, '${jsesc(cert.serial)}', ${cert.trusted})">${cert.trusted ? 'Untrust' : 'Trust'}</button>`
+      : '';
+    const firstSAN = pickFirstSAN(cert.sans);
+    const sanLine = firstSAN
+      ? `<div class="cn-san">${esc(firstSAN)}${(cert.sans||[]).length > 1 ? ` <span class="dn-key">(+${cert.sans.length-1})</span>` : ''}</div>`
+      : '';
+    node.innerHTML = `<div class="cn-tags">${tags}</div>
+      <div class="cn-subject">${fmtDNShort(cert.subject, 3)}</div>
+      ${sanLine}
+      <div class="cn-meta">${cert.not_before.substring(0,10)} — ${cert.not_after.substring(0,10)}${fmtRemaining(cert.not_after, cert.not_before)}</div>
+      <div class="cert-actions">
+        <button onclick="event.stopPropagation(); copyB64(this, '${jsesc(cert.der_b64)}')">Copy B64</button>
+        <button onclick="event.stopPropagation(); saveDER('${jsesc(cert.der_b64)}', '${jsesc(cert.serial)}')">Save .cer</button>
+        <button onclick="event.stopPropagation(); shareLink(this, '${jsesc(cert.thumbprint_sha1)}', ${i === 0})">Link</button>
+        ${adminBtn}
+      </div>`;
+    node.addEventListener('click', (e) => { e.stopPropagation(); selectCert(e, chain, i, 'cert'); });
+    chainEl.appendChild(node);
+
+    if (cert.issued_crls && cert.issued_crls.length) {
+      cert.issued_crls.forEach((crl, ci) => {
+        if (crl.errors && crl.errors.length) return;
+        const crlNode = document.createElement('div');
+        crlNode.className = 'crl-inline';
+        const rev = crl.cert_revoked ? ' <span class="crl-revoked">REVOKED</span>' : '';
+        const sigTag = crlSigTag(crl);
+        const scopeTag = crl.has_idp
+          ? ' <span class="tag unchecked" title="issuingDistributionPoint present — scope not analyzed, revocation may be incomplete">scope partial</span>'
+          : '';
+        const fname = (crl.urls[0]||'crl').split('/').pop().replace(/[^a-zA-Z0-9_.-]/g,'_');
+        crlNode.innerHTML = `<div class="cn-tags"><span class="tag ca">CRL</span>${rev}${sigTag}${scopeTag}</div>
+          <div class="crl-summary">${esc(crl.this_update).substring(0,10)} — ${esc(crl.next_update).substring(0,10)}${fmtRemaining(crl.next_update)} · ${crl.revoked_count} revoked</div>
+          <div class="cert-actions">
+            <button onclick="event.stopPropagation(); copyB64(this, '${jsesc(crl.der_b64)}')">Copy B64</button>
+            <button onclick="event.stopPropagation(); saveCRL('${jsesc(crl.der_b64)}', '${jsesc(fname)}')">Save .crl</button>
+          </div>`;
+        crlNode.addEventListener('click', (e) => { e.stopPropagation(); selectCert(e, chain, i, 'crl', ci); });
+        node.appendChild(crlNode);
+      });
+    }
+
+    if (cert.issued_ocsps && cert.issued_ocsps.length) {
+      cert.issued_ocsps.forEach((ocsp, oi) => {
+        const ocspNode = document.createElement('div');
+        ocspNode.className = 'crl-inline';
+        const cap = s => s ? s[0].toUpperCase() + s.slice(1) : s;
+        let statusTag = '';
+        if (ocsp.status === 'revoked') statusTag = ' <span class="crl-revoked">Revoked</span>';
+        else if (ocsp.status === 'good') statusTag = ''; // good — not noisy
+        else statusTag = ' <span style="color:var(--yellow)">' + esc(cap(ocsp.status)) + '</span>';
+        const verTag = ocsp.verified
+          ? ''
+          : ' <span class="tag bad" title="OCSP response signature not verified against issuer — response was ignored for revocation decision">sig NOT verified</span>';
+        const dates = ocsp.next_update
+          ? `${esc(ocsp.this_update).substring(0,10)} — ${esc(ocsp.next_update).substring(0,10)}${fmtRemaining(ocsp.next_update)}`
+          : `${esc(ocsp.this_update).substring(0,10)} (no nextUpdate)`;
+        ocspNode.innerHTML = `<div class="cn-tags"><span class="tag ca">OCSP</span>${statusTag}${verTag}</div>
+          <div class="crl-summary">for ${fmtDNShort(ocsp.cert_subject, 2)} · ${dates}</div>
+          <div class="cert-actions">
+            <button onclick="event.stopPropagation(); copyB64(this, '${jsesc(ocsp.der_b64)}')">Copy B64</button>
+            <button onclick="event.stopPropagation(); saveOCSP('${jsesc(ocsp.der_b64)}', '${jsesc(ocsp.cert_serial||'ocsp')}')">Save .ocsp</button>
+          </div>`;
+        ocspNode.addEventListener('click', (e) => { e.stopPropagation(); selectCert(e, chain, i, 'ocsp', oi); });
+        node.appendChild(ocspNode);
+      });
+    }
+  });
+
+  // Details
+  if (chain.length > 0) {
+    const firstNode = chainEl.querySelector('.chain-node');
+    selectCert({currentTarget: firstNode}, chain, 0, 'cert');
+  }
+
+  // Warnings
+  const warnSection = document.getElementById('warnings-section');
+  const warnList = document.getElementById('warnings-list');
+  if (data.warnings && data.warnings.length > 0) {
+    warnSection.style.display = '';
+    warnList.innerHTML = data.warnings.map(w => `<li>${esc(w)}</li>`).join('');
+  } else {
+    warnSection.style.display = 'none';
+  }
+}
+
+function selectCert(e, chain, idx, mode, crlIdx) {
+  document.querySelectorAll('.chain-node').forEach(n => n.classList.remove('selected'));
+  document.querySelectorAll('.crl-inline').forEach(n => n.classList.remove('selected'));
+  e.currentTarget.classList.add('selected');
+
+  if (mode === 'crl') {
+    return selectCRL(chain[idx], crlIdx);
+  }
+  if (mode === 'ocsp') {
+    return selectOCSP(chain[idx], crlIdx);
+  }
+
+  const cert = chain[idx];
+  const el = document.getElementById('cert-details');
+  const validity = fmtRemaining(cert.not_after, cert.not_before);
+
+  const aia = (cert.aia_urls||[]).map(u => `<tr><td>AIA</td><td>${esc(u)}</td></tr>`).join('');
+  const ocsp = (cert.ocsp_urls||[]).map(u => `<tr><td>OCSP</td><td>${esc(u)}</td></tr>`).join('');
+  const cdp = (cert.cdp_urls||[]).map(u => `<tr><td>CDP</td><td>${esc(u)}</td></tr>`).join('');
+  const hasLinks = aia || ocsp || cdp;
+
+  el.innerHTML = `<table>
+    <tr><td colspan="2" class="detail-label">Subject</td></tr>
+    <tr><td></td><td>${fmtDN(cert.subject)}</td></tr>
+
+    ${(cert.sans && cert.sans.length) ? `
+    <tr><td colspan="2" class="detail-label">Subject Alternative Names</td></tr>
+    ${cert.sans.map(s => `<tr><td></td><td>${esc(s)}</td></tr>`).join('')}
+    ` : ''}
+
+    <tr><td colspan="2" class="detail-label">Issuer</td></tr>
+    <tr><td></td><td>${fmtDN(cert.issuer)}</td></tr>
+
+    <tr><td colspan="2" class="detail-label">Details</td></tr>
+    <tr><td>Serial</td><td>${esc(cert.serial)}</td></tr>
+    <tr><td>Not Before</td><td>${esc(cert.not_before)}</td></tr>
+    <tr><td>Not After</td><td>${esc(cert.not_after)}${validity}</td></tr>
+    <tr><td>CA</td><td>${cert.is_ca ? 'Yes' : 'No'}${cert.is_ca && cert.path_len >= 0 ? ` (pathlen: ${cert.path_len})` : ''}</td></tr>
+    <tr><td>Self-Signed</td><td>${cert.is_self_signed ? 'Yes' : 'No'}</td></tr>
+
+    ${cert.key_algorithm ? `
+    <tr><td colspan="2" class="detail-label">Public Key</td></tr>
+    <tr><td>Algorithm</td><td>${algoFull(cert.key_algorithm)}</td></tr>
+    ${cert.key_bits ? `<tr><td>Bits</td><td>${cert.key_bits}</td></tr>` : ''}
+    ${cert.key_curve ? `<tr><td>Curve</td><td>${esc(cert.key_curve)}</td></tr>` : ''}
+    ` : ''}
+
+    ${cert.signature_algorithm ? `
+    <tr><td colspan="2" class="detail-label">Certificate Signature</td></tr>
+    <tr><td>Algorithm</td><td>${algoFull(cert.signature_algorithm)}</td></tr>
+    ` : ''}
+
+    ${(cert.key_usage && cert.key_usage.length) ? `
+    <tr><td colspan="2" class="detail-label">Key Usage</td></tr>
+    <tr><td></td><td>${cert.key_usage.map(k => esc(k)).join(', ')}</td></tr>
+    ` : ''}
+
+    ${(cert.ekus && cert.ekus.length) ? `
+    <tr><td colspan="2" class="detail-label">Extended Key Usage</td></tr>
+    ${cert.ekus.map(e => `<tr><td></td><td>${ekuFull(e)}</td></tr>`).join('')}
+    ` : ''}
+
+    <tr><td colspan="2" class="detail-label">Thumbprint</td></tr>
+    <tr><td>SHA-1</td><td>${esc(cert.thumbprint_sha1)}</td></tr>
+    <tr><td>SHA-256</td><td>${esc(cert.thumbprint_sha256)}</td></tr>
+
+    ${cert.ski || cert.aki ? `
+    <tr><td colspan="2" class="detail-label">Key Identifiers</td></tr>
+    ${cert.ski ? `<tr><td>SKI</td><td>${esc(cert.ski)}</td></tr>` : ''}
+    ${cert.aki ? `<tr><td>AKI</td><td>${esc(cert.aki)}</td></tr>` : ''}
+    ` : ''}
+
+    ${hasLinks ? `
+    <tr><td colspan="2" class="detail-label">Distribution</td></tr>
+    ${aia}${cdp}${ocsp}
+    ` : ''}
+
+    ${cert.revocation ? `
+    <tr><td colspan="2" class="detail-label">Revocation</td></tr>
+    <tr><td>${esc(cert.revocation.via)}</td><td>${
+      cert.revocation.status === 'revoked'
+        ? '<span class="crl-revoked">REVOKED</span>'
+        : '<span style="color:var(--green)">Not revoked</span>'
+    }</td></tr>
+    ` : ''}
+  </table>`;
+
+  el.querySelectorAll('td:last-child').forEach(td => {
+    if (td.colSpan > 1) return;
+    td.addEventListener('click', () => {
+      copyToClipboard(td.textContent.trim(), null, null);
+      td.classList.add('copied');
+      setTimeout(() => td.classList.remove('copied'), 1000);
+    });
+  });
+}
+
+function selectOCSP(cert, oi) {
+  const ocsp = cert.issued_ocsps[oi];
+  const el = document.getElementById('cert-details');
+  const verBadge = ocsp.verified
+    ? ''
+    : ' <span class="verify-badge error" title="OCSP response signature did not verify against issuer — response was NOT used for revocation decision">Signature NOT verified</span>';
+  let statusBadge = '';
+  if (ocsp.status === 'good') statusBadge = '<span class="verify-badge ok">Good</span>';
+  else if (ocsp.status === 'revoked') statusBadge = '<span class="verify-badge error">Revoked</span>';
+  else statusBadge = `<span class="verify-badge warn">${esc(ocsp.status[0].toUpperCase() + ocsp.status.slice(1))}</span>`;
+
+  el.innerHTML = `<table>
+    <tr><td colspan="2" class="detail-label">OCSP Response</td></tr>
+    <tr><td>Status</td><td>${statusBadge} ${verBadge}</td></tr>
+    <tr><td>For Cert</td><td>${fmtDN(ocsp.cert_subject)}</td></tr>
+    <tr><td>Cert Serial</td><td>${esc(ocsp.cert_serial)}</td></tr>
+
+    <tr><td colspan="2" class="detail-label">Validity</td></tr>
+    ${ocsp.this_update ? `<tr><td>This Update</td><td>${esc(ocsp.this_update)}</td></tr>` : ''}
+    ${ocsp.next_update ? `<tr><td>Next Update</td><td>${esc(ocsp.next_update)}${fmtRemaining(ocsp.next_update)}</td></tr>` : ''}
+    ${ocsp.produced_at ? `<tr><td>Produced At</td><td>${esc(ocsp.produced_at)}</td></tr>` : ''}
+
+    <tr><td colspan="2" class="detail-label">Source</td></tr>
+    <tr><td>Origin</td><td>${esc(ocsp.source)}</td></tr>
+    ${ocsp.url ? `<tr><td>Responder URL</td><td>${esc(ocsp.url)}</td></tr>` : ''}
+  </table>`;
+
+  el.querySelectorAll('td:last-child').forEach(td => {
+    if (td.colSpan > 1) return;
+    td.addEventListener('click', () => {
+      copyToClipboard(td.textContent.trim(), null, null);
+      td.classList.add('copied');
+      setTimeout(() => td.classList.remove('copied'), 1000);
+    });
+  });
+}
+
+function selectCRL(cert, crlIdx) {
+  const crl = cert.issued_crls[crlIdx];
+  const el = document.getElementById('cert-details');
+
+  let sigCell;
+  if (!crl.signature_status || crl.signature_status === 'verified') {
+    sigCell = `<span style="color:#1a7f37">verified</span>`;
+  } else if (crl.signature_status === 'bad') {
+    sigCell = `<span style="color:var(--red)">FAILED</span> · ${esc(crl.signature_msg || '')}`;
+  } else {
+    sigCell = `<span style="color:var(--text2)">unchecked</span> · ${esc(crl.signature_msg || '')}`;
+  }
+  const akiRow = crl.aki
+    ? `<tr><td>AKI</td><td>${esc(crl.aki)}</td></tr>`
+    : '';
+  const scopeRow = crl.has_idp
+    ? `<tr><td>Scope</td><td><span style="color:var(--text2)">partial</span> · issuingDistributionPoint present, not analyzed (revocation may be incomplete)</td></tr>`
+    : '';
+
+  el.innerHTML = `<table>
+    <tr><td colspan="2" class="detail-label">Issuer</td></tr>
+    <tr><td></td><td>${fmtDN(crl.issuer)}</td></tr>
+    ${akiRow}
+
+    <tr><td colspan="2" class="detail-label">Details</td></tr>
+    <tr><td>This Update</td><td>${esc(crl.this_update)}</td></tr>
+    <tr><td>Next Update</td><td>${esc(crl.next_update)}${fmtRemaining(crl.next_update)}</td></tr>
+    <tr><td>Revoked</td><td>${crl.revoked_count} certificates</td></tr>
+    <tr><td>Source</td><td>${esc(crl.source)}</td></tr>
+    <tr><td>Signature</td><td>${sigCell}</td></tr>
+    ${scopeRow}
+
+    <tr><td colspan="2" class="detail-label">Distribution Points</td></tr>
+    ${(crl.urls||[]).map(u => `<tr><td>CDP</td><td>${esc(u)}</td></tr>`).join('')}
+  </table>`;
+
+  el.querySelectorAll('td:last-child').forEach(td => {
+    if (td.colSpan > 1) return;
+    td.addEventListener('click', () => {
+      copyToClipboard(td.textContent.trim(), null, null);
+      td.classList.add('copied');
+      setTimeout(() => td.classList.remove('copied'), 1000);
+    });
+  });
+}
+
+function esc(s) {
+  if (s == null) return '';
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+// Escape for inline JavaScript string literal (single-quoted)
+function jsesc(s) {
+  if (s == null) return '';
+  return String(s)
+    .replace(/\\/g, '\\\\')
+    .replace(/'/g, "\\'")
+    .replace(/"/g, '\\"')
+    .replace(/</g, '\\x3c')
+    .replace(/>/g, '\\x3e')
+    .replace(/\r/g, '\\r')
+    .replace(/\n/g, '\\n')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
+}
+
+function copyToClipboard(text, btn, label) {
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.opacity = '0';
+  document.body.appendChild(ta);
+  ta.select();
+  document.execCommand('copy');
+  document.body.removeChild(ta);
+  if (btn) {
+    btn.classList.add('copied');
+    btn.textContent = 'Copied';
+    setTimeout(() => { btn.classList.remove('copied'); btn.textContent = label; }, 1500);
+  }
+}
+
+function copyB64(btn, b64) {
+  copyToClipboard(b64, btn, 'Copy Base64');
+}
+
+function copyPEM(btn, b64) {
+  const lines = b64.match(/.{1,64}/g) || [];
+  const pem = '-----BEGIN CERTIFICATE-----\n' + lines.join('\n') + '\n-----END CERTIFICATE-----\n';
+  copyToClipboard(pem, btn, 'Copy PEM');
+}
+
+async function toggleTrust(btn, serial, currentlyTrusted) {
+  const action = currentlyTrusted ? 'untrust' : 'trust';
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '...';
+  try {
+    const resp = await fetch('/api/' + action, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({serial: serial}),
+    });
+    if (!resp.ok) throw new Error(await resp.text());
+
+    // Update local cert state
+    const cert = window.__lastData.chain.find(c => c.serial === serial);
+    if (cert) cert.trusted = !currentlyTrusted;
+
+    // Re-evaluate verify.trusted: walk chain top-down, find first trusted cert
+    if (window.__lastData.verify.status === 'ok') {
+      let trustedCert = null;
+      for (let i = window.__lastData.chain.length - 1; i >= 0; i--) {
+        if (window.__lastData.chain[i].trusted) {
+          trustedCert = window.__lastData.chain[i];
+          break;
+        }
+      }
+      window.__lastData.verify.trusted = !!trustedCert;
+      window.__lastData.verify.trust_via = trustedCert ? trustedCert.subject : '';
+    }
+
+    render(window.__lastData);
+  } catch (e) {
+    showError('Failed', e.message);
+    btn.disabled = false;
+    btn.textContent = orig;
+  }
+}
+
+function saveDER(b64, serial) {
+  const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+  const blob = new Blob([bytes], { type: 'application/pkix-cert' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = serial + '.cer';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+function pickFirstSAN(sans) {
+  if (!sans || !sans.length) return '';
+  // Prefer DNS, then IP, then anything
+  for (const s of sans) if (s.startsWith('DNS:')) return s;
+  for (const s of sans) if (s.startsWith('IP')) return s;
+  return sans[0];
+}
+
+function fmtDuration(ms) {
+  if (ms < 0) return '';
+  const sec = Math.floor(ms / 1000);
+  const min = Math.floor(sec / 60);
+  const hrs = Math.floor(min / 60);
+  const days = Math.floor(hrs / 24);
+  const years = Math.floor(days / 365);
+  const remDays = days % 365;
+  const remHrs = hrs % 24;
+
+  if (days >= 7) {
+    if (years > 0) return `${years}y${remDays}d`;
+    return `${days}d`;
+  }
+  if (days > 0) return `${days}d${remHrs}h`;
+  if (hrs > 0) return `${hrs}h${min % 60}m`;
+  return `${min}m`;
+}
+
+function fmtRemaining(notAfter, notBefore) {
+  const now = Date.now();
+  const after = new Date(notAfter).getTime();
+  const before = notBefore ? new Date(notBefore).getTime() : 0;
+
+  if (now > after) {
+    const ago = fmtDuration(now - after);
+    return ` <span style="color:var(--red)">(expired ${ago} ago)</span>`;
+  }
+  if (before && now < before) {
+    return ` <span style="color:var(--yellow)">(not yet valid)</span>`;
+  }
+  const left = fmtDuration(after - now);
+  const color = (after - now) < 7 * 86400000 ? 'var(--yellow)' : 'var(--green)';
+  return ` <span style="color:${color}">(${left})</span>`;
+}
+
+const ALGO_OIDS = {
+  // RSA
+  '1.2.840.113549.1.1.1':   { full: 'rsaEncryption',                  short: 'RSA' },
+  '1.2.840.113549.1.1.10':  { full: 'rsassa-pss',                     short: 'RSA-PSS' },
+
+  // EC
+  '1.2.840.10045.2.1':      { full: 'id-ecPublicKey',                 short: 'ECDSA' },
+
+  // EdDSA
+  '1.3.101.112':            { full: 'Ed25519',                        short: 'Ed25519' },
+  '1.3.101.113':            { full: 'Ed448',                          short: 'Ed448' },
+  '1.3.101.110':            { full: 'X25519',                         short: 'X25519' },
+  '1.3.101.111':            { full: 'X448',                           short: 'X448' },
+
+  // DSA
+  '1.2.840.10040.4.1':      { full: 'id-dsa',                         short: 'DSA' },
+
+  // GOST
+  '1.2.643.7.1.1.1.1':      { full: 'id-tc26-gost3410-2012-256',      short: 'GOST' },
+  '1.2.643.7.1.1.1.2':      { full: 'id-tc26-gost3410-2012-512',      short: 'GOST' },
+  '1.2.643.7.1.1.3.2':      { full: 'id-tc26-signwithdigest-gost3410-2012-256', short: 'GOST' },
+  '1.2.643.7.1.1.3.3':      { full: 'id-tc26-signwithdigest-gost3410-2012-512', short: 'GOST' },
+  '1.2.643.2.2.19':         { full: 'GOST R 34.10-2001',              short: 'GOST' },
+  '1.2.643.2.2.20':         { full: 'GOST R 34.10-94',                short: 'GOST' },
+  '1.2.643.2.2.3':          { full: 'GOST R 34.11-94 with GOST R 34.10-2001', short: 'GOST' },
+  '1.2.643.2.2.4':          { full: 'GOST R 34.11-94 with GOST R 34.10-94', short: 'GOST' },
+};
+
+function algoLookup(oid) {
+  return ALGO_OIDS[oid] || { full: oid, short: oid };
+}
+
+function algoTag(cert) {
+  if (!cert.key_algorithm) return '';
+  const info = algoLookup(cert.key_algorithm);
+  return `<span class="tag algo" title="${esc(cert.key_algorithm)}">${esc(info.short)}</span>`;
+}
+
+function isGostOID(oid) {
+  if (!oid) return false;
+  const info = ALGO_OIDS[oid];
+  if (info && info.short === 'GOST') return true;
+  return oid.startsWith('1.2.643.7.1.1.1.') ||
+    oid.startsWith('1.2.643.7.1.1.3.');
+}
+
+function certCryptoState(cert) {
+  if (!cert.key_algorithm || !cert.signature_algorithm) return 'unknown';
+  const keyGost = isGostOID(cert.key_algorithm);
+  const sigGost = isGostOID(cert.signature_algorithm);
+  if (keyGost && sigGost) return 'gost';
+  if (!keyGost && !sigGost) return 'global';
+  return 'mixed';
+}
+
+function chainCryptoBadge(chain) {
+  if (!chain || chain.length === 0) return null;
+  const states = chain.map(certCryptoState);
+  if (states.includes('mixed')) {
+    return {
+      cls: 'warn',
+      label: 'GOST mixed',
+      title: 'At least one certificate mixes GOST with non-GOST key/signature algorithms'
+    };
+  }
+  if (states.includes('unknown')) {
+    return {
+      cls: 'warn',
+      label: 'Unknown',
+      title: 'At least one certificate is missing key or signature algorithm data'
+    };
+  }
+  if (states.every(s => s === 'gost')) {
+    return {
+      cls: 'ok',
+      label: 'GOST',
+      title: 'Every certificate in the chain uses GOST key and GOST signature algorithms'
+    };
+  }
+  if (states.includes('gost')) {
+    return {
+      cls: 'warn',
+      label: 'GOST mixed',
+      title: 'The chain contains both GOST-only and non-GOST certificates'
+    };
+  }
+  return {
+    cls: 'ok',
+    label: 'Global',
+    title: 'No GOST key or signature algorithms were found in the chain'
+  };
+}
+
+function algoFull(oid) {
+  const info = algoLookup(oid);
+  if (info.full === oid) return esc(oid);
+  return `${esc(oid)} <span class="dn-key">(${esc(info.full)})</span>`;
+}
+
+const EKU_OIDS = {
+  // RFC 5280 standard EKUs
+  '2.5.29.37.0':            { full: 'Any Extended Key Usage',   short: 'Any' },
+  '1.3.6.1.5.5.7.3.1':      { full: 'TLS Web Server Authentication', short: 'TLS Server' },
+  '1.3.6.1.5.5.7.3.2':      { full: 'TLS Web Client Authentication', short: 'TLS Client' },
+  '1.3.6.1.5.5.7.3.3':      { full: 'Code Signing',             short: 'Code Signing' },
+  '1.3.6.1.5.5.7.3.4':      { full: 'E-mail Protection (S/MIME)', short: 'Email' },
+  '1.3.6.1.5.5.7.3.5':      { full: 'IPsec End System',         short: 'IPsec ES' },
+  '1.3.6.1.5.5.7.3.6':      { full: 'IPsec Tunnel',             short: 'IPsec Tunnel' },
+  '1.3.6.1.5.5.7.3.7':      { full: 'IPsec User',               short: 'IPsec User' },
+  '1.3.6.1.5.5.7.3.8':      { full: 'Time Stamping',            short: 'Timestamping' },
+  '1.3.6.1.5.5.7.3.9':      { full: 'OCSP Signing',             short: 'OCSP' },
+  '1.3.6.1.5.5.7.3.10':     { full: 'DVCS',                     short: 'DVCS' },
+  '1.3.6.1.5.5.7.3.13':     { full: 'EAP over PPP',             short: 'EAP-PPP' },
+  '1.3.6.1.5.5.7.3.14':     { full: 'EAP over LAN',             short: 'EAP-LAN' },
+  '1.3.6.1.5.5.7.3.17':     { full: 'IPsec IKE',                short: 'IKE' },
+  '1.3.6.1.5.5.7.3.18':     { full: 'Capwap AC',                short: 'Capwap AC' },
+  '1.3.6.1.5.5.7.3.19':     { full: 'Capwap WTP',               short: 'Capwap WTP' },
+
+  // Older/legacy IPsec
+  '1.3.6.1.5.5.8.2.2':      { full: 'iKEIntermediate',          short: 'IKE' },
+
+  // Microsoft EKUs
+  '1.3.6.1.4.1.311.10.3.1':  { full: 'Microsoft Trust List Signing', short: 'MS CTL' },
+  '1.3.6.1.4.1.311.10.3.3':  { full: 'Microsoft Server Gated Crypto', short: 'MS SGC' },
+  '1.3.6.1.4.1.311.10.3.4':  { full: 'Microsoft Encrypting File System', short: 'MS EFS' },
+  '1.3.6.1.4.1.311.10.3.4.1':{ full: 'Microsoft EFS Recovery', short: 'MS EFS Recovery' },
+  '1.3.6.1.4.1.311.10.3.5':  { full: 'Windows Hardware Driver Verification', short: 'MS HW Driver' },
+  '1.3.6.1.4.1.311.10.3.10': { full: 'Microsoft Qualified Subordination', short: 'MS Qualified' },
+  '1.3.6.1.4.1.311.10.3.11': { full: 'Microsoft Key Recovery', short: 'MS Key Recovery' },
+  '1.3.6.1.4.1.311.10.3.12': { full: 'Microsoft Document Signing', short: 'MS Doc Sign' },
+  '1.3.6.1.4.1.311.10.3.13': { full: 'Microsoft Lifetime Signing', short: 'MS Lifetime' },
+  '1.3.6.1.4.1.311.20.2.2':  { full: 'Microsoft Smart Card Logon', short: 'Smart Card' },
+  '1.3.6.1.4.1.311.21.5':    { full: 'Microsoft CA Encryption Cert', short: 'MS CA Enc' },
+  '1.3.6.1.4.1.311.21.6':    { full: 'Microsoft Key Recovery Agent', short: 'MS KRA' },
+  '1.3.6.1.4.1.311.21.19':   { full: 'Microsoft Directory Service Email Replication', short: 'MS DS Replication' },
+
+  // Netscape
+  '2.16.840.1.113730.4.1':   { full: 'Netscape Server Gated Crypto', short: 'NS SGC' },
+
+  // Adobe
+  '1.2.840.113583.1.1.5':    { full: 'Adobe PDF Signing',        short: 'PDF Sign' },
+
+  // Russian / GOST EKUs (TK 26)
+  '1.2.643.2.2.34.6':        { full: 'Russian End User',         short: 'RU End User' },
+  '1.2.643.3.5.10.2.12':     { full: 'CryptoPro Document Sign',  short: 'CP Doc Sign' },
+  '1.2.643.3.131.1.1':       { full: 'Russian INN',              short: 'INN' },
+  '1.2.643.100.4':           { full: 'Russian INN (TC26)',       short: 'INN' },
+  '1.2.643.2.45.1.6.1':      { full: 'SMEV Signing',             short: 'SMEV' },
+  '1.2.643.2.2.49.1.1':      { full: 'Russian Class 1 Signing',  short: 'KC1' },
+  '1.2.643.2.2.49.1.2':      { full: 'Russian Class 2 Signing',  short: 'KC2' },
+  '1.2.643.2.2.49.1.3':      { full: 'Russian Class 3 Signing',  short: 'KC3' },
+
+  // Apple
+  '1.2.840.113635.100.1.2':  { full: 'Apple Code Signing',       short: 'Apple Sign' },
+  '1.2.840.113635.100.4.13': { full: 'Apple Software Update',    short: 'Apple Update' },
+};
+
+function ekuLookup(oid) {
+  return EKU_OIDS[oid] || { full: oid, short: oid };
+}
+
+function ekuTag(eku) {
+  const info = ekuLookup(eku);
+  return `<span class="tag eku" title="${esc(eku)}">${esc(info.short)}</span>`;
+}
+
+// Returns tag HTML for CRL signature state. Empty string when verified
+// (the golden path — no badge clutter).
+function crlSigTag(crl) {
+  const st = crl.signature_status;
+  if (!st || st === 'verified') return '';
+  if (st === 'bad') {
+    return ` <span class="tag bad" title="${esc(crl.signature_msg || 'signature mismatch')}">sig FAILED</span>`;
+  }
+  // 'unchecked' — issuer CA not in chain/store, we can't verify
+  return ` <span class="tag unchecked" title="${esc(crl.signature_msg || 'issuer not available')}">sig unchecked</span>`;
+}
+
+function ekuFull(oid) {
+  const info = ekuLookup(oid);
+  if (info.full === oid) return esc(oid);
+  return `${esc(oid)} <span class="dn-key">(${esc(info.full)})</span>`;
+}
+
+const DN_ORDER = ['CN','SN','GN','SERIALNUMBER','TITLE','OU','O','STREET','L','ST','C','emailAddress','INN','OGRN','SNILS'];
+
+function dnSortKey(key) {
+  const idx = DN_ORDER.indexOf(key);
+  return idx >= 0 ? idx : 100;
+}
+
+function parseDN(s) {
+  if (!s) return [];
+  // OpenSSL XN_FLAG_ONELINE: fields separated by ", ", values containing
+  // special chars are wrapped in "..." with \" escapes, other chars may be
+  // backslash-escaped. Cannot just split on comma.
+  const parts = [];
+  let cur = '';
+  let inQuote = false;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === '\\' && i + 1 < s.length) {
+      cur += s[i + 1];
+      i++;
+      continue;
+    }
+    if (c === '"') {
+      inQuote = !inQuote;
+      continue;
+    }
+    if (c === ',' && !inQuote) {
+      parts.push(cur);
+      cur = '';
+      while (i + 1 < s.length && s[i + 1] === ' ') i++;
+      continue;
+    }
+    cur += c;
+  }
+  if (cur.length) parts.push(cur);
+
+  return parts.map(part => {
+    const eq = part.indexOf('=');
+    if (eq < 0) return { key: '', val: part };
+    return { key: part.substring(0, eq).trim(), val: part.substring(eq + 1).trim() };
+  }).sort((a, b) => dnSortKey(a.key) - dnSortKey(b.key));
+}
+
+function fmtDN(s) {
+  return parseDN(s).map(f =>
+    `<span class="dn-line"><span class="dn-key">${esc(f.key)}</span><span class="dn-eq"> = </span><span class="dn-val">${esc(f.val)}</span></span>`
+  ).join('');
+}
+
+function fmtDNShort(s, n) {
+  return parseDN(s).slice(0, n || 3).map(f =>
+    `<span class="dn-key">${esc(f.key)}</span><span class="dn-eq"> = </span><span class="dn-val">${esc(f.val)}</span>`
+  ).join('<span class="dn-sep">, </span>');
+}
+</script>
+</body>
+</html>

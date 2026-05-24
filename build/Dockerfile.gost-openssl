@@ -1,0 +1,71 @@
+# OpenSSL CLI with GOST provider support
+FROM debian:bookworm-slim AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc g++ make perl curl ca-certificates git cmake libc6-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+ARG OPENSSL_VERSION=3.5.5
+
+# Build OpenSSL (shared libs + CLI apps)
+RUN curl -fSL "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz" \
+    | tar -xz -C /tmp && \
+    cd /tmp/openssl-${OPENSSL_VERSION} && \
+    ./config --prefix=/opt/openssl --libdir=lib \
+        shared no-tests no-docs && \
+    make -j$(nproc) && \
+    make install_sw install_ssldirs && \
+    rm -rf /tmp/openssl-${OPENSSL_VERSION}
+
+# Build gost-engine as shared provider module
+RUN git clone --depth 1 https://github.com/gost-engine/engine.git /tmp/gost-engine && \
+    cd /tmp/gost-engine && git submodule update --init && \
+    mkdir build && cd build && \
+    cmake \
+        -DOPENSSL_ROOT_DIR=/opt/openssl \
+        -DOPENSSL_ENGINES_DIR=/opt/openssl/lib/engines-3 \
+        -DOPENSSL_MODULES_DIR=/opt/openssl/lib/ossl-modules \
+        .. && \
+    make -j$(nproc) && \
+    cp bin/gostprov.so /opt/openssl/lib/ossl-modules/gost.so && \
+    cp bin/gost.so /opt/openssl/lib/engines-3/ && \
+    rm -rf /tmp/gost-engine
+
+# Runtime
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+COPY --from=builder /opt/openssl /opt/openssl
+ENV PATH="/opt/openssl/bin:$PATH"
+ENV LD_LIBRARY_PATH="/opt/openssl/lib"
+ENV OPENSSL_CONF="/opt/openssl/ssl/openssl.cnf"
+
+# Configure GOST provider
+RUN printf '\
+openssl_conf = openssl_init\n\
+\n\
+[openssl_init]\n\
+providers = provider_sect\n\
+engines = engine_sect\n\
+\n\
+[provider_sect]\n\
+default = default_sect\n\
+gost = gost_sect\n\
+\n\
+[default_sect]\n\
+activate = 1\n\
+\n\
+[gost_sect]\n\
+activate = 1\n\
+module = /opt/openssl/lib/ossl-modules/gost.so\n\
+\n\
+[engine_sect]\n\
+gost = gost_engine_sect\n\
+\n\
+[gost_engine_sect]\n\
+default_algorithms = ALL\n\
+dynamic_path = /opt/openssl/lib/engines-3/gost.so\n\
+engine_id = gost\n' \
+    > /opt/openssl/ssl/openssl.cnf
+
+ENTRYPOINT ["openssl"]

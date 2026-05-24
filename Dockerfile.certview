@@ -1,0 +1,43 @@
+# Stage 1: Build libminipki.a for linux-amd64
+FROM pidmitrius/minipki-zig-build:latest AS c-build
+COPY --from=minipki-core /include/ /src/include/
+COPY --from=minipki-core /src/ /src/src/
+COPY --from=minipki-core /build/Makefile /src/build/Makefile
+WORKDIR /src/build
+RUN make out/linux-amd64/libminipki.a
+
+# Stage 2: Build Go binary (linked against shared libcrypto from gost-openssl)
+FROM golang:1.24-bookworm AS go-build
+
+COPY --from=gost-openssl /opt/openssl/include/ /opt/openssl/include/
+COPY --from=gost-openssl /opt/openssl/lib/libcrypto.so.3 /opt/openssl/lib/
+RUN ln -s libcrypto.so.3 /opt/openssl/lib/libcrypto.so
+COPY --from=c-build /src/build/out/linux-amd64/libminipki.a /opt/lib/
+COPY --from=c-build /src/include/minipki.h /opt/include/
+
+ENV CGO_ENABLED=1
+ENV CGO_CFLAGS="-I/opt/include -I/opt/openssl/include"
+ENV CGO_LDFLAGS="/opt/lib/libminipki.a -L/opt/openssl/lib -lcrypto -lpthread -ldl"
+ENV LD_LIBRARY_PATH=/opt/openssl/lib
+
+WORKDIR /app
+COPY . .
+RUN go mod tidy \
+    && go test ./cmd/certview ./internal/dnshost \
+    && go build -o /certview ./cmd/certview
+
+# Stage 3: Runtime with shared OpenSSL + GOST engine
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=gost-openssl /opt/openssl/lib/libcrypto.so.3 /opt/openssl/lib/
+COPY --from=gost-openssl /opt/openssl/lib/engines-3/gost.so /opt/openssl/lib/engines-3/
+COPY --from=go-build /certview /usr/local/bin/certview
+RUN mkdir -p /data && chown -R 65532:65532 /data
+ENV LD_LIBRARY_PATH=/opt/openssl/lib
+ENV MINIPKI_GOST_ENGINE=/opt/openssl/lib/engines-3/gost.so
+VOLUME /data
+EXPOSE 8080 8081
+USER 65532:65532
+ENTRYPOINT ["certview", "-db", "/data/certview.db", "-admin-addr", ":8081"]

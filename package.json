@@ -1,0 +1,9 @@
+{
+  "private": true,
+  "scripts": {
+    "e2e": "playwright test e2e/certview.spec.js --reporter=line"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.60.0"
+  }
+}
