@@ -1,0 +1,8 @@
+node_modules/
+test-results/
+playwright-report/
+.git/
+e2e/
+package.json
+package-lock.json
+REVIEW_*.md
