@@ -13,7 +13,7 @@ This repository contains:
 - `build/Dockerfile.gost-openssl`: source Dockerfile for the OpenSSL/GOST runtime image used by certget.
 - `e2e`: browser tests for site-analysis routing and copy/deep-link behavior.
 
-`certview` depends on MiniPKI core for the C ABI library (`minipki.h`, `libminipki.a`). Local Docker builds read that source via the `MINIPKI_CORE_DIR` build context, defaulting to `/home/claw/work/MiniPKI`.
+`certview` depends on MiniPKI core for the C ABI library (`minipki.h`, `libminipki.a`). Local Docker builds read that source via the `MINIPKI_CORE_DIR` build context. By default the local script uses a `minipki/` submodule when present, otherwise `/home/claw/work/MiniPKI`.
 
 ## Local development
 

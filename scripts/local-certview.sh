@@ -3,7 +3,13 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROJECT="${COMPOSE_PROJECT_NAME:-certview-local}"
-MINIPKI_CORE_DIR="${MINIPKI_CORE_DIR:-/home/claw/work/MiniPKI}"
+if [[ -z "${MINIPKI_CORE_DIR:-}" ]]; then
+  if [[ -d "$ROOT/minipki/include" ]]; then
+    MINIPKI_CORE_DIR="$ROOT/minipki"
+  else
+    MINIPKI_CORE_DIR="/home/claw/work/MiniPKI"
+  fi
+fi
 HTTP_PORT="${CERTVIEW_HTTP_PORT:-18080}"
 ADMIN_PORT="${CERTVIEW_ADMIN_PORT:-18081}"
 HTTP_BIND="${CERTVIEW_HTTP_BIND:-0.0.0.0}"
