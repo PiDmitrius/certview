@@ -20,5 +20,5 @@ ENV PATH="/opt/openssl/bin:${PATH}"
 ENV LD_LIBRARY_PATH="/opt/openssl/lib"
 ENV OPENSSL_CONF="/opt/openssl/ssl/openssl.cnf"
 USER 65532:65532
-EXPOSE 9090
-ENTRYPOINT ["certget", "-addr", ":9090"]
+EXPOSE 8080
+ENTRYPOINT ["certget", "-addr", ":8080"]

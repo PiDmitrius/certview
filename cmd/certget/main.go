@@ -35,7 +35,7 @@ import (
 )
 
 func main() {
-	addr := flag.String("addr", ":9090", "listen address")
+	addr := flag.String("addr", ":8080", "listen address")
 	flag.Parse()
 
 	all := []Fetcher{

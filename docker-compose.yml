@@ -8,7 +8,7 @@ services:
     image: pidmitrius/certview:latest
     restart: unless-stopped
     environment:
-      CERTGET_URL: http://certget:9090
+      CERTGET_URL: http://certget:8080
     ports:
       - "${CERTVIEW_HTTP_BIND:-0.0.0.0}:${CERTVIEW_HTTP_PORT:-8080}:8080"
       - "${CERTVIEW_ADMIN_BIND:-127.0.0.1}:${CERTVIEW_ADMIN_PORT:-8081}:8081"
