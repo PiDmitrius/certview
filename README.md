@@ -10,6 +10,7 @@ This repository contains:
 - `cmd/certget`: stateless TLS probe used by certview for site analysis, including GOST-capable OpenSSL probing.
 - `web`: embedded single-page UI.
 - `Dockerfile.certview`, `Dockerfile.certget`, `docker-compose.yml`: local and production container build/deploy assets.
+- `build/Dockerfile.gost-openssl`: source Dockerfile for the OpenSSL/GOST runtime image used by certget.
 - `e2e`: browser tests for site-analysis routing and copy/deep-link behavior.
 
 `certview` depends on MiniPKI core for the C ABI library (`minipki.h`, `libminipki.a`). Local Docker builds read that source via the `MINIPKI_CORE_DIR` build context, defaulting to `/home/claw/work/MiniPKI`.
