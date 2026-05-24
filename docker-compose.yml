@@ -1,11 +1,11 @@
 services:
   certget:
-    image: pidmitrius/certget:latest
+    image: pidmitrius/certget:${CERTGET_TAG:-latest}
     restart: unless-stopped
     networks: [internal]
 
   certview:
-    image: pidmitrius/certview:latest
+    image: pidmitrius/certview:${CERTVIEW_TAG:-latest}
     restart: unless-stopped
     environment:
       CERTGET_URL: http://certget:8080
