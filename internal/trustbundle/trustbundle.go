@@ -17,8 +17,8 @@ var russianPEM []byte
 
 // ImportDefaults imports bundled CA certs on every start. Self-signed certs
 // become trusted roots unless already imported from the same bundle, so an
-// admin's untrust of a bundled root survives restarts; intermediates go to the
-// regular cache.
+// admin's untrust of a bundled root survives restarts; intermediates join the
+// pool of candidate issuers.
 func ImportDefaults(ctx *pki.Context, st *store.Store) error {
 	log.Printf("trustbundle: %d new trusted roots from Mozilla bundle",
 		importBundle(ctx, st, mozillaPEM, "mozilla"))
@@ -47,7 +47,7 @@ func importBundle(ctx *pki.Context, st *store.Store, data []byte, source string)
 				trustedCount++
 			}
 		} else {
-			if err := st.SaveBundledCert(
+			if err := st.SavePoolCert(
 				info.Subject, info.Issuer, info.Serial,
 				info.SKI, info.AKI, info.SubjectNameDER,
 				info.DER, info.IsCA, info.IsSelfSigned, source,

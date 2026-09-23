@@ -155,7 +155,7 @@ func TestIssuerPoolExcludesUploads(t *testing.T) {
 	if ders, _ := s.FindAllCertsByNameDER(name, 8); len(ders) != 0 {
 		t.Fatal("uploaded certificate offered as issuer by name")
 	}
-	if err := s.SaveBundledCert("CN=I", "CN=R", "02", "AB", "", name, []byte("bundled"), true, false, "ru-gov"); err != nil {
+	if err := s.SavePoolCert("CN=I", "CN=R", "02", "AB", "", name, []byte("bundled"), true, false, "ru-gov"); err != nil {
 		t.Fatal(err)
 	}
 	if der, _ := s.FindCertBySKI("AB"); string(der) != "bundled" {
@@ -226,7 +226,7 @@ func TestAnchoredJoinsPoolAndSHA256Lookup(t *testing.T) {
 	if got, _ := s.FindCertBySKI("CD"); got != nil {
 		t.Fatal("archived certificate in the issuer pool")
 	}
-	if err := s.AnchorCert("CN=I", "CN=R", "05", "CD", "", name, der, false); err != nil {
+	if err := s.SavePoolCert("CN=I", "CN=R", "05", "CD", "", name, der, true, false, ""); err != nil {
 		t.Fatal(err)
 	}
 	if got, _ := s.FindCertBySKI("CD"); !bytes.Equal(got, der) {

@@ -958,9 +958,9 @@ func (h *handler) trustedPath(der []byte, roots, intermediates [][]byte) (string
 	}
 	for _, c := range vr.Chain {
 		if c.IsCA && len(c.DER) > 0 {
-			if err := h.store.AnchorCert(c.Subject, c.Issuer, c.Serial, c.SKI, c.AKI,
-				c.SubjectNameDER, c.DER, c.IsSelfSigned); err != nil {
-				log.Printf("store.AnchorCert(%s): %v", c.Subject, err)
+			if err := h.store.SavePoolCert(c.Subject, c.Issuer, c.Serial, c.SKI, c.AKI,
+				c.SubjectNameDER, c.DER, true, c.IsSelfSigned, ""); err != nil {
+				log.Printf("store.SavePoolCert(%s): %v", c.Subject, err)
 			}
 		}
 	}
