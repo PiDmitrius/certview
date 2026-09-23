@@ -27,11 +27,13 @@ func SHA256Hex(der []byte) string {
 var derTables = []string{"certs", "crls", "ocsp_responses"}
 
 // A certificate is identified by the SHA-256 of its DER: serials are unique
-// only per issuer, so trust and deduplication never go by serial. Any
-// certificate may be stored, but only trusted or bundled ones are candidate
-// issuers for analyses (poolCond): whatever else is stored came from untrusted
-// uploads, sites or AIA responses and must not steer other analyses. CRLs are
-// stored once per content, with fetch URLs mapped to it in crl_urls.
+// only per issuer, so trust and deduplication never go by serial. Every
+// certificate seen is archived and found only by its exact thumbprint. The
+// pool of candidate issuers (poolCond) is only trusted, bundled or anchored
+// certificates — anchored meaning a CA verified on a path to a trusted root —
+// so nothing an upload, a site or an AIA response supplies can steer other
+// analyses. CRLs are stored once per content, with fetch URLs mapped to it
+// in crl_urls.
 const certsDDL = `CREATE TABLE IF NOT EXISTS %s (
 	id               INTEGER PRIMARY KEY,
 	subject          TEXT    NOT NULL,
@@ -42,6 +44,7 @@ const certsDDL = `CREATE TABLE IF NOT EXISTS %s (
 	subject_name_der BLOB,
 	trusted          INTEGER NOT NULL DEFAULT 0,
 	bundled          INTEGER NOT NULL DEFAULT 0,
+	anchored         INTEGER NOT NULL DEFAULT 0,
 	thumbprint_sha1  TEXT    NOT NULL DEFAULT '',
 	sha256           TEXT    NOT NULL DEFAULT '',
 	der              BLOB    NOT NULL,
@@ -51,9 +54,9 @@ const certsDDL = `CREATE TABLE IF NOT EXISTS %s (
 	created_at       INTEGER NOT NULL
 )`
 
-const certsColumns = "id, subject, issuer, serial, ski, aki, subject_name_der, trusted, bundled, thumbprint_sha1, sha256, der, is_ca, is_self_signed, source_url, created_at"
+const certsColumns = "id, subject, issuer, serial, ski, aki, subject_name_der, trusted, bundled, anchored, thumbprint_sha1, sha256, der, is_ca, is_self_signed, source_url, created_at"
 
-const poolCond = "(trusted = 1 OR bundled = 1)"
+const poolCond = "(trusted = 1 OR bundled = 1 OR anchored = 1)"
 
 const crlsDDL = `CREATE TABLE IF NOT EXISTS %s (
 	id          INTEGER PRIMARY KEY,
@@ -122,6 +125,7 @@ func (s *Store) migrate() error {
 	s.db.Exec("ALTER TABLE certs ADD COLUMN trusted INTEGER NOT NULL DEFAULT 0")
 	s.db.Exec("ALTER TABLE certs ADD COLUMN thumbprint_sha1 TEXT NOT NULL DEFAULT ''")
 	s.db.Exec("ALTER TABLE certs ADD COLUMN bundled INTEGER NOT NULL DEFAULT 0")
+	s.db.Exec("ALTER TABLE certs ADD COLUMN anchored INTEGER NOT NULL DEFAULT 0")
 	for _, t := range derTables {
 		s.db.Exec("ALTER TABLE " + t + " ADD COLUMN sha256 TEXT NOT NULL DEFAULT ''")
 		if err := s.backfillSHA256(t); err != nil {
@@ -402,14 +406,20 @@ func (s *Store) SaveCert(subject, issuer, serial, ski, aki string, subjectNameDE
 	return err
 }
 
-func (s *Store) FindCertByThumbprint(sha1Hex string) ([]byte, error) {
-	if sha1Hex == "" {
+// FindCertByThumbprint finds a certificate by its SHA-1 or SHA-256 thumbprint.
+func (s *Store) FindCertByThumbprint(hexDigest string) ([]byte, error) {
+	column := "thumbprint_sha1"
+	switch len(hexDigest) {
+	case 40:
+	case 64:
+		column = "sha256"
+	default:
 		return nil, nil
 	}
 	var der []byte
 	err := s.db.QueryRow(
-		"SELECT der FROM certs WHERE thumbprint_sha1 = ? LIMIT 1",
-		strings.ToUpper(sha1Hex),
+		"SELECT der FROM certs WHERE "+column+" = ? LIMIT 1",
+		strings.ToUpper(hexDigest),
 	).Scan(&der)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -508,6 +518,21 @@ func (s *Store) ImportTrustedCert(subject, issuer, serial, ski, aki string, subj
 	}
 	n, err := res.RowsAffected()
 	return n > 0, err
+}
+
+// AnchorCert stores a CA verified on a path to a trusted root as a candidate
+// issuer.
+func (s *Store) AnchorCert(subject, issuer, serial, ski, aki string, subjectNameDER, der []byte, isSelfSigned bool) error {
+	_, err := s.db.Exec(`
+		INSERT INTO certs
+			(subject, issuer, serial, ski, aki, subject_name_der, anchored, thumbprint_sha1, sha256, der,
+			 is_ca, is_self_signed, source_url, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, 1, ?, '', ?)
+		ON CONFLICT(sha256) DO UPDATE SET anchored = 1`,
+		subject, issuer, serial, ski, aki, subjectNameDER, sha1hex(der), SHA256Hex(der), der,
+		btoi(isSelfSigned), time.Now().Unix(),
+	)
+	return err
 }
 
 // SaveBundledCert stores a bundled intermediate as a candidate issuer.

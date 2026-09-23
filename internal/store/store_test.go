@@ -211,3 +211,31 @@ func TestRepairSHA1Once(t *testing.T) {
 		t.Fatal("thumbprint not repaired")
 	}
 }
+
+func TestAnchoredJoinsPoolAndSHA256Lookup(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "certview.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	name := []byte("ca name")
+	der := []byte("intermediate der")
+	if err := s.SaveCert("CN=I", "CN=R", "05", "CD", "", name, der, true, false, "tls"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.FindCertBySKI("CD"); got != nil {
+		t.Fatal("archived certificate in the issuer pool")
+	}
+	if err := s.AnchorCert("CN=I", "CN=R", "05", "CD", "", name, der, false); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.FindCertBySKI("CD"); !bytes.Equal(got, der) {
+		t.Fatal("anchored CA not in the issuer pool")
+	}
+	if got, _ := s.FindCertByThumbprint(SHA256Hex(der)); !bytes.Equal(got, der) {
+		t.Fatal("not found by SHA-256 thumbprint")
+	}
+	if got, _ := s.FindCertByThumbprint(sha1hex(der)); !bytes.Equal(got, der) {
+		t.Fatal("not found by SHA-1 thumbprint")
+	}
+}

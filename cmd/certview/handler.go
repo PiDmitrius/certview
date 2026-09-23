@@ -390,6 +390,12 @@ func (h *handler) analyzeData(ctx context.Context, rl reqLog, data []byte, bag [
 	}
 
 	rl.f("chain: %d certs total", len(chain))
+	for _, entry := range chain[1:] {
+		h.archive(rl, entry.info, entry.source)
+	}
+	for _, c := range aiaBag {
+		h.archive(rl, c.info, c.source)
+	}
 	for _, entry := range chain {
 		c := entry.info
 		if len(c.AIAURLs) > maxAIAURLs || len(c.CDPURLs) > maxCDPURLs || len(c.OCSPURLs) > maxOCSPURLs {
@@ -932,7 +938,8 @@ func (h *handler) doAnalyzeCRL(rl reqLog, start time.Time, data []byte, crl *pki
 
 // trustedPath verifies der with only the trusted roots among roots as
 // anchors, so trust follows the path OpenSSL verified rather than the chain
-// certview resolved; it returns the anchor's subject.
+// certview resolved; it returns the anchor's subject. The CAs on a verified
+// path join the pool of candidate issuers.
 func (h *handler) trustedPath(der []byte, roots, intermediates [][]byte) (string, bool) {
 	var anchors [][]byte
 	for _, r := range roots {
@@ -947,7 +954,24 @@ func (h *handler) trustedPath(der []byte, roots, intermediates [][]byte) (string
 	if err != nil || vr.ChainStatus != "ok" || len(vr.Chain) == 0 {
 		return "", false
 	}
+	for _, c := range vr.Chain {
+		if c.IsCA && len(c.DER) > 0 {
+			if err := h.store.AnchorCert(c.Subject, c.Issuer, c.Serial, c.SKI, c.AKI,
+				c.SubjectNameDER, c.DER, c.IsSelfSigned); err != nil {
+				log.Printf("store.AnchorCert(%s): %v", c.Subject, err)
+			}
+		}
+	}
 	return vr.Chain[len(vr.Chain)-1].Subject, true
+}
+
+// archive stores a certificate seen in an analysis; archived certificates
+// are found only by thumbprint.
+func (h *handler) archive(rl reqLog, c *pki.CertInfo, source string) {
+	if err := h.store.SaveCert(c.Subject, c.Issuer, c.Serial, c.SKI, c.AKI, c.SubjectNameDER,
+		c.DER, c.IsCA, c.IsSelfSigned, source); err != nil {
+		rl.f("store.SaveCert: %v", err)
+	}
 }
 
 // chainsToTrust reports whether cert verifies, through stored certificates,

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -89,6 +90,12 @@ func TestChainsToTrustByContent(t *testing.T) {
 	}
 	if via, ok := h.trustedPath(inter.Raw, [][]byte{root.Raw, lookalike.Raw}, nil); !ok || via == "" {
 		t.Fatal("path to the trusted root not trusted")
+	}
+	if der, _ := st.FindCertByNameDER(inter.RawSubject); !bytes.Equal(der, inter.Raw) {
+		t.Fatal("CA on a verified path did not join the issuer pool")
+	}
+	if der, _ := st.FindCertByNameDER(lookalike.RawSubject); bytes.Equal(der, lookalike.Raw) {
+		t.Fatal("lookalike root joined the issuer pool")
 	}
 
 	forged, forgedKey := issue(t, "Forged", 1, nil, nil)
