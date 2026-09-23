@@ -107,31 +107,18 @@ func (h *handler) respondSite(w http.ResponseWriter, r *http.Request, host strin
 		return
 	}
 
-	// Cache + singleflight: parallel callers on the same (host,port,sni) wait
-	// for one fetch+analyze pass; fresh entries are served without certget contact.
-	var entry *respCacheEntry[siteResponse]
-	if h.siteCache != nil {
-		key := fmt.Sprintf("%s|%d|%s", host, port, sni)
-		entry = h.siteCache.entryFor(key)
-		entry.mu.Lock()
-		if cached := entry.fresh(); cached != nil {
-			entry.mu.Unlock()
-			respCopy := *cached
-			respCopy.Cached = true
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(respCopy)
-			return
-		}
-		defer entry.mu.Unlock()
-	}
-
-	resp, err := h.doAnalyzeSite(r.Context(), host, port, sni)
+	key := fmt.Sprintf("%s|%d|%s", host, port, sni)
+	resp, hit, err := h.siteCache.get(r.Context(), key, func() (*siteResponse, error) {
+		return h.doAnalyzeSite(r.Context(), host, port, sni)
+	})
 	if err != nil {
 		writeAnalysisError(w, err)
 		return
 	}
-	if entry != nil {
-		entry.store(resp, h.siteCache.ttl)
+	if hit {
+		respCopy := *resp
+		respCopy.Cached = true
+		resp = &respCopy
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
@@ -139,6 +126,11 @@ func (h *handler) respondSite(w http.ResponseWriter, r *http.Request, host strin
 
 func (h *handler) doAnalyzeSite(ctx context.Context, host string, port int, sni string) (*siteResponse, error) {
 	rl := reqLog{id: reqCounter.Add(1)}
+	ctx, release, err := guardAnalysis(ctx, rl)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	rl.f("site: host=%s port=%d sni=%s", host, port, sni)
 
 	cgResp, err := h.callCertget(ctx, host, port, sni)
@@ -201,7 +193,7 @@ func (h *handler) doAnalyzeSite(ctx context.Context, host string, port int, sni 
 			}
 		}
 
-		analysis, err := h.doAnalyze(ctx, ders[0])
+		analysis, err := h.analyzeData(ctx, rl, ders[0])
 		if err != nil {
 			return nil, err
 		}

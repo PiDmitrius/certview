@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
+// respCache remembers computed responses for ttl. Parallel callers on the
+// same key wait for one computation; waiting honours the caller's context,
+// and the gate is released before the caller writes its response.
 type respCache[T any] struct {
 	mu      sync.Mutex
 	entries map[string]*respCacheEntry[T]
@@ -13,73 +16,61 @@ type respCache[T any] struct {
 }
 
 type respCacheEntry[T any] struct {
-	mu      sync.Mutex // singleflight gate: hold across fresh()/store() to serialize parallel callers on the same key
+	gate    chan struct{}
 	resp    *T
-	expires atomic.Int64 // unix nano; 0 = no value yet
+	expires time.Time
 }
 
 func newRespCache[T any](ttl time.Duration) *respCache[T] {
-	c := &respCache[T]{
-		entries: make(map[string]*respCacheEntry[T]),
-		ttl:     ttl,
-	}
+	c := &respCache[T]{entries: make(map[string]*respCacheEntry[T]), ttl: ttl}
 	go c.cleanupLoop()
 	return c
 }
 
-func (c *respCache[T]) entryFor(key string) *respCacheEntry[T] {
+// get returns the cached response for key, or computes and caches it; hit
+// reports a cached response.
+func (c *respCache[T]) get(ctx context.Context, key string, compute func() (*T, error)) (resp *T, hit bool, err error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	e, ok := c.entries[key]
 	if !ok {
-		e = &respCacheEntry[T]{}
+		e = &respCacheEntry[T]{gate: make(chan struct{}, 1)}
 		c.entries[key] = e
 	}
-	return e
-}
+	c.mu.Unlock()
 
-// fresh returns the cached response if it is still valid. Caller must hold e.mu.
-func (e *respCacheEntry[T]) fresh() *T {
-	if e.resp == nil {
-		return nil
+	select {
+	case e.gate <- struct{}{}:
+	case <-ctx.Done():
+		return nil, false, ctx.Err()
 	}
-	if time.Now().UnixNano() > e.expires.Load() {
-		return nil
-	}
-	return e.resp
-}
+	defer func() { <-e.gate }()
 
-// store sets the cached response with the given TTL. Caller must hold e.mu.
-func (e *respCacheEntry[T]) store(resp *T, ttl time.Duration) {
-	e.resp = resp
-	e.expires.Store(time.Now().Add(ttl).UnixNano())
+	if e.resp != nil && time.Now().Before(e.expires) {
+		return e.resp, true, nil
+	}
+	if resp, err = compute(); err != nil {
+		return nil, false, err
+	}
+	e.resp, e.expires = resp, time.Now().Add(c.ttl)
+	return resp, false, nil
 }
 
 func (c *respCache[T]) cleanupLoop() {
-	t := time.NewTicker(5 * time.Minute)
+	t := time.NewTicker(max(c.ttl, 5*time.Second))
 	defer t.Stop()
 	for range t.C {
-		c.cleanup()
-	}
-}
-
-func (c *respCache[T]) cleanup() {
-	now := time.Now().UnixNano()
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for k, e := range c.entries {
-		if now <= e.expires.Load() {
-			continue
+		now := time.Now()
+		c.mu.Lock()
+		for k, e := range c.entries {
+			select {
+			case e.gate <- struct{}{}:
+				if !now.Before(e.expires) {
+					delete(c.entries, k)
+				}
+				<-e.gate
+			default:
+			}
 		}
-		// If a fetcher holds the per-key mutex right now, leave the entry
-		// alone — deleting it would break the singleflight invariant (the
-		// in-flight goroutine would then store its response into an entry
-		// that's no longer in the map, and a concurrent caller would create
-		// a fresh entry and issue a duplicate fetch).
-		if !e.mu.TryLock() {
-			continue
-		}
-		delete(c.entries, k)
-		e.mu.Unlock()
+		c.mu.Unlock()
 	}
 }

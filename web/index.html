@@ -898,7 +898,7 @@ function render(data) {
     if (cert.ekus) cert.ekus.forEach(e => { tags += ekuTag(e) + ' '; });
     // Trust only makes PKI sense for self-signed roots
     const adminBtn = (window.__isAdmin && cert.is_self_signed)
-      ? `<button onclick="event.stopPropagation(); toggleTrust(this, '${jsesc(cert.serial)}', ${cert.trusted})">${cert.trusted ? 'Untrust' : 'Trust'}</button>`
+      ? `<button onclick="event.stopPropagation(); toggleTrust(this, '${jsesc(cert.thumbprint_sha256)}', ${cert.trusted})">${cert.trusted ? 'Untrust' : 'Trust'}</button>`
       : '';
     const firstSAN = pickFirstSAN(cert.sans);
     const sanLine = firstSAN
@@ -1212,7 +1212,7 @@ function copyPEM(btn, b64) {
   copyToClipboard(pem, btn, 'Copy PEM');
 }
 
-async function toggleTrust(btn, serial, currentlyTrusted) {
+async function toggleTrust(btn, sha256, currentlyTrusted) {
   const action = currentlyTrusted ? 'untrust' : 'trust';
   const orig = btn.textContent;
   btn.disabled = true;
@@ -1221,12 +1221,12 @@ async function toggleTrust(btn, serial, currentlyTrusted) {
     const resp = await fetch('/api/' + action, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({serial: serial}),
+      body: JSON.stringify({sha256: sha256}),
     });
     if (!resp.ok) throw new Error(await resp.text());
 
     // Update local cert state
-    const cert = window.__lastData.chain.find(c => c.serial === serial);
+    const cert = window.__lastData.chain.find(c => c.thumbprint_sha256 === sha256);
     if (cert) cert.trusted = !currentlyTrusted;
 
     // Re-evaluate verify.trusted: walk chain top-down, find first trusted cert

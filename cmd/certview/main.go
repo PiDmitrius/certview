@@ -38,9 +38,13 @@ func newGuardedHTTPClient(idle, timeout time.Duration) *http.Client {
 					return nil, err
 				}
 				if err := ssrfguard.Check(ctx, host); err != nil {
-					return nil, fmt.Errorf("ssrfguard: %w", err)
+					return nil, fmt.Errorf("%w: ssrfguard: %w", errUnreachable, err)
 				}
-				return dialer.DialContext(ctx, network, address)
+				conn, err := dialer.DialContext(ctx, network, address)
+				if err != nil {
+					return nil, fmt.Errorf("%w: %w", errUnreachable, err)
+				}
+				return conn, nil
 			},
 		}},
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {

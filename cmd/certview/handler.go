@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	neturl "net/url"
 	"strings"
@@ -265,6 +266,12 @@ func nvl(s, fallback string) string {
 }
 
 func (h *handler) analyze(w http.ResponseWriter, r *http.Request) {
+	releaseIO, err := acquireBigIO(r.Context(), r.ContentLength)
+	if err != nil {
+		writeAnalysisError(w, err)
+		return
+	}
+	defer releaseIO()
 	data, err := readLimited(r.Body, r.ContentLength, maxCRLSize)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusRequestEntityTooLarge)
@@ -274,22 +281,19 @@ func (h *handler) analyze(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "empty body", http.StatusBadRequest)
 		return
 	}
-	h.respondAnalysis(w, r, data)
+	h.respondAnalysis(w, r, data, releaseIO)
 }
 
-// respondAnalysis runs one pass for parallel callers on the same bytes.
-func (h *handler) respondAnalysis(w http.ResponseWriter, r *http.Request, data []byte) {
-	entry := h.analysisCache.entryFor(store.SHA256Hex(data))
-	entry.mu.Lock()
-	defer entry.mu.Unlock()
-	resp := entry.fresh()
-	if resp == nil {
-		var err error
-		if resp, err = h.doAnalyze(r.Context(), data); err != nil {
-			writeAnalysisError(w, err)
-			return
-		}
-		entry.store(resp, h.analysisCache.ttl)
+// respondAnalysis calls done once the input is no longer needed, before the
+// response is written.
+func (h *handler) respondAnalysis(w http.ResponseWriter, r *http.Request, data []byte, done func()) {
+	resp, _, err := h.analysisCache.get(r.Context(), store.SHA256Hex(data), func() (*analyzeResponse, error) {
+		return h.doAnalyze(r.Context(), data)
+	})
+	done()
+	if err != nil {
+		writeAnalysisError(w, err)
+		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
@@ -302,6 +306,11 @@ func (h *handler) doAnalyze(ctx context.Context, data []byte) (*analyzeResponse,
 		return nil, err
 	}
 	defer release()
+	return h.analyzeData(ctx, rl, data)
+}
+
+// analyzeData runs one analysis within a context from guardAnalysis.
+func (h *handler) analyzeData(ctx context.Context, rl reqLog, data []byte) (*analyzeResponse, error) {
 	start := time.Now()
 	resp := &analyzeResponse{}
 
@@ -345,6 +354,7 @@ func (h *handler) doAnalyze(ctx context.Context, data []byte) (*analyzeResponse,
 	}
 
 	chain := []chainEntry{{info: leaf, source: "upload"}}
+	var aiaBag []bagCert
 	seen := map[string]bool{store.SHA256Hex(leaf.DER): true}
 
 	current := leaf
@@ -355,7 +365,7 @@ func (h *handler) doAnalyze(ctx context.Context, data []byte) (*analyzeResponse,
 		depth := len(chain)
 		rl.f("chain[%d]: resolving issuer of %q", depth, current.Subject)
 
-		info, source := h.resolveIssuer(ctx, rl, current, resp)
+		info, source := h.resolveIssuer(ctx, rl, current, resp, &aiaBag)
 		if info == nil {
 			rl.f("chain[%d]: ISSUER NOT FOUND", depth)
 			break
@@ -394,9 +404,10 @@ func (h *handler) doAnalyze(ctx context.Context, data []byte) (*analyzeResponse,
 	issuerCRLs := make(map[int][]crlJSON)
 	issuerOCSPs := make(map[int][]ocspJSON)
 	type pendingCRL struct {
-		info *pki.CRLInfo
-		url  string
-		der  []byte
+		info   *pki.CRLInfo
+		url    string
+		der    []byte
+		issuer *pki.CertInfo
 	}
 	var verifiedCRLs []pendingCRL
 
@@ -511,9 +522,9 @@ func (h *handler) doAnalyze(ctx context.Context, data []byte) (*analyzeResponse,
 				crlChecked = true
 			}
 
-			// Fetched CRLs are persisted after the chain verifies to a trusted anchor.
+			// Fetched CRLs are persisted once their issuer is known to chain to a trusted anchor.
 			if authoritative && source == "fetched" {
-				verifiedCRLs = append(verifiedCRLs, pendingCRL{crlInfo, url, crlDER})
+				verifiedCRLs = append(verifiedCRLs, pendingCRL{crlInfo, url, crlDER, crlIssuer})
 			}
 
 			thisFmt := crlInfo.ThisUpdate.Format(time.RFC3339)
@@ -759,24 +770,19 @@ func (h *handler) doAnalyze(ctx context.Context, data []byte) (*analyzeResponse,
 			resp.Verify.RevocationStatus, resp.Verify.RevocationMsg)
 
 		if vr.ChainStatus == "ok" {
-			for i := len(chain) - 1; i >= 0; i-- {
-				trusted, _ := h.store.IsCertTrusted(chain[i].info.Serial)
-				if trusted {
-					resp.Verify.Trusted = true
-					resp.Verify.TrustVia = chain[i].info.Subject
-					rl.f("verify: trusted via %q", chain[i].info.Subject)
-					break
-				}
-			}
-			if !resp.Verify.Trusted {
+			if via, ok := h.trustedPath(leaf.DER, roots, intermediates); ok {
+				resp.Verify.Trusted = true
+				resp.Verify.TrustVia = via
+				rl.f("verify: trusted via %q", via)
+			} else {
 				rl.f("verify: chain ok but no trusted anchor found")
 			}
 		}
 	}
 
 	for _, c := range verifiedCRLs {
-		if !resp.Verify.Trusted {
-			rl.f("crl: not saved, chain has no trusted anchor: %s", c.url)
+		if !h.chainsToTrust(c.issuer) {
+			rl.f("crl: not saved, issuer has no trusted anchor: %s", c.url)
 			continue
 		}
 		if err := h.store.SaveCRL(c.info.Issuer, c.url, c.der, c.info.ThisUpdate, c.info.NextUpdate); err != nil {
@@ -796,9 +802,7 @@ func (h *handler) doAnalyze(ctx context.Context, data []byte) (*analyzeResponse,
 		}
 		cj.IssuedCRLs = issuerCRLs[i]
 		cj.IssuedOCSPs = issuerOCSPs[i]
-		if t, _ := h.store.IsCertTrusted(entry.info.Serial); t {
-			cj.Trusted = true
-		}
+		cj.Trusted = h.trusted(entry.info)
 		resp.Chain = append(resp.Chain, cj)
 	}
 
@@ -873,9 +877,7 @@ func (h *handler) doAnalyzeCRL(rl reqLog, start time.Time, data []byte, crl *pki
 			rl.f("CRL signature check failed: %v", err)
 
 			cj := h.certToJSON(caInfo, "cache")
-			if t, _ := h.store.IsCertTrusted(caInfo.Serial); t {
-				cj.Trusted = true
-			}
+			cj.Trusted = h.trusted(caInfo)
 			cj.IssuedCRLs = []crlJSON{crlJ}
 			resp.Chain = append(resp.Chain, cj)
 			resp.Verify = verifyJSON{
@@ -899,9 +901,7 @@ func (h *handler) doAnalyzeCRL(rl reqLog, start time.Time, data []byte, crl *pki
 		crlJ.derJSON = h.derRef(data)
 
 		cj := h.certToJSON(caInfo, "cache")
-		if t, _ := h.store.IsCertTrusted(caInfo.Serial); t {
-			cj.Trusted = true
-		}
+		cj.Trusted = h.trusted(caInfo)
 		cj.IssuedCRLs = []crlJSON{crlJ}
 		resp.Chain = append(resp.Chain, cj)
 		resp.Verify = verifyJSON{Status: "ok"}
@@ -931,9 +931,32 @@ func (h *handler) doAnalyzeCRL(rl reqLog, start time.Time, data []byte, crl *pki
 	return resp
 }
 
-// chainsToTrust reports whether cert verifies to a trusted anchor using only
-// stored certificates.
+// trustedPath verifies der with only the trusted roots among roots as
+// anchors, so trust follows the path OpenSSL verified rather than the chain
+// certview resolved; it returns the anchor's subject.
+func (h *handler) trustedPath(der []byte, roots, intermediates [][]byte) (string, bool) {
+	var anchors [][]byte
+	for _, r := range roots {
+		if t, _ := h.store.IsCertTrusted(store.SHA256Hex(r)); t {
+			anchors = append(anchors, r)
+		}
+	}
+	if len(anchors) == 0 {
+		return "", false
+	}
+	vr, err := h.ctx.Verify(der, anchors, intermediates)
+	if err != nil || vr.ChainStatus != "ok" || len(vr.Chain) == 0 {
+		return "", false
+	}
+	return vr.Chain[len(vr.Chain)-1].Subject, true
+}
+
+// chainsToTrust reports whether cert verifies, through stored certificates,
+// to a trusted root.
 func (h *handler) chainsToTrust(cert *pki.CertInfo) bool {
+	if h.trusted(cert) {
+		return true
+	}
 	var roots, intermediates [][]byte
 	names := [][]byte{cert.IssuerNameDER}
 	seen := map[string]bool{}
@@ -958,22 +981,31 @@ func (h *handler) chainsToTrust(cert *pki.CertInfo) bool {
 			}
 		}
 	}
-	if cert.IsSelfSigned {
-		roots = append(roots, cert.DER)
-	}
-	vr, err := h.ctx.Verify(cert.DER, roots, intermediates)
-	if err != nil || vr.ChainStatus != "ok" {
-		return false
-	}
-	for _, c := range vr.Chain {
-		if trusted, _ := h.store.IsCertTrusted(c.Serial); trusted {
-			return true
-		}
-	}
-	return false
+	_, ok := h.trustedPath(cert.DER, roots, intermediates)
+	return ok
 }
 
-func (h *handler) resolveIssuer(ctx context.Context, rl reqLog, cert *pki.CertInfo, resp *analyzeResponse) (*pki.CertInfo, string) {
+func (h *handler) trusted(c *pki.CertInfo) bool {
+	t, _ := h.store.IsCertTrusted(store.SHA256Hex(c.DER))
+	return t
+}
+
+// bagCert is a certificate from an AIA response, a candidate issuer for the
+// rest of the analysis; only certificates chosen as issuers are stored.
+type bagCert struct {
+	info *pki.CertInfo
+	url  string
+}
+
+func (h *handler) saveIssuer(rl reqLog, c bagCert) {
+	i := c.info
+	if err := h.store.SaveCert(i.Subject, i.Issuer, i.Serial, i.SKI, i.AKI, i.SubjectNameDER,
+		i.DER, i.IsCA, i.IsSelfSigned, c.url); err != nil {
+		rl.f("  store.SaveCert: %v", err)
+	}
+}
+
+func (h *handler) resolveIssuer(ctx context.Context, rl reqLog, cert *pki.CertInfo, resp *analyzeResponse, bag *[]bagCert) (*pki.CertInfo, string) {
 	// Validate that a candidate issuer actually matches: SKI must equal cert's AKI
 	tryCandidate := func(der []byte, hint string) *pki.CertInfo {
 		info, err := h.ctx.ParseCertInfo(der)
@@ -1023,7 +1055,17 @@ func (h *handler) resolveIssuer(ctx context.Context, rl reqLog, cert *pki.CertIn
 		rl.f("  cache: subject=%q → miss", cert.Issuer)
 	}
 
-	// 4. Fetch via AIA
+	// 4. Certificates from AIA responses earlier in this analysis
+	for _, c := range *bag {
+		if (cert.AKI != "" && c.info.SKI == cert.AKI) ||
+			(cert.AKI == "" && bytes.Equal(c.info.SubjectNameDER, cert.IssuerNameDER)) {
+			rl.f("  AIA bag: matched %q", c.info.Subject)
+			h.saveIssuer(rl, c)
+			return c.info, "fetched"
+		}
+	}
+
+	// 5. Fetch via AIA
 	if len(cert.AIAURLs) == 0 {
 		rl.f("  NO AIA URLs")
 		resp.Warnings = append(resp.Warnings, "No AIA URL in: "+cert.Subject)
@@ -1052,7 +1094,7 @@ func (h *handler) resolveIssuer(ctx context.Context, rl reqLog, cert *pki.CertIn
 			continue
 		}
 
-		// Pick the matching cert for chain continuation and save only it.
+		// Pick the matching cert for chain continuation; the rest stay in the bag.
 		// Prefer self-signed cert when multiple match by SKI (shortest chain).
 		var match *pki.CertInfo
 		var allParsed []*pki.CertInfo
@@ -1065,6 +1107,7 @@ func (h *handler) resolveIssuer(ctx context.Context, rl reqLog, cert *pki.CertIn
 				continue
 			}
 			allParsed = append(allParsed, info)
+			*bag = append(*bag, bagCert{info, url})
 		}
 
 		// Selection priority: self-signed SKI match > any SKI match > any cert
@@ -1093,13 +1136,7 @@ func (h *handler) resolveIssuer(ctx context.Context, rl reqLog, cert *pki.CertIn
 				rl.f("  AIA: WARNING — no SKI match, using first cert (AKI=%s, got SKI=%s)",
 					cert.AKI, match.SKI)
 			}
-			if err := h.store.SaveCert(
-				match.Subject, match.Issuer, match.Serial,
-				match.SKI, match.AKI, match.SubjectNameDER,
-				match.DER, match.IsCA, match.IsSelfSigned, url,
-			); err != nil {
-				rl.f("  store.SaveCert: %v", err)
-			}
+			h.saveIssuer(rl, bagCert{match, url})
 			return match, "fetched"
 		}
 	}
@@ -1165,6 +1202,17 @@ func (h *handler) fetchCRL(ctx context.Context, rl reqLog, url string) (*pki.CRL
 }
 
 func (h *handler) derBySHA256(w http.ResponseWriter, r *http.Request) {
+	size, err := h.store.DERSize(r.PathValue("sha256"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	release, err := acquireBigIO(r.Context(), int64(size))
+	if err != nil {
+		writeAnalysisError(w, err)
+		return
+	}
+	defer release()
 	der, err := h.store.FindDERBySHA256(r.PathValue("sha256"))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -1174,6 +1222,7 @@ func (h *handler) derBySHA256(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
+	http.NewResponseController(w).SetWriteDeadline(time.Now().Add(derWriteTime))
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	w.Write(der)
@@ -1194,7 +1243,7 @@ func (h *handler) analyzeByThumbprint(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not found", http.StatusNotFound)
 		return
 	}
-	h.respondAnalysis(w, r, der)
+	h.respondAnalysis(w, r, der, func() {})
 }
 
 func (h *handler) trust(w http.ResponseWriter, r *http.Request) {
@@ -1207,17 +1256,17 @@ func (h *handler) untrust(w http.ResponseWriter, r *http.Request) {
 
 func (h *handler) toggleTrust(w http.ResponseWriter, r *http.Request, trusted bool) {
 	var req struct {
-		Serial string `json:"serial"`
+		SHA256 string `json:"sha256"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Serial == "" {
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.SHA256 == "" {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	if err := h.store.SetTrusted(req.Serial, trusted); err != nil {
+	if err := h.store.SetTrusted(req.SHA256, trusted); err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
-	log.Printf("[admin] cert %s → trusted=%v", req.Serial, trusted)
+	log.Printf("[admin] cert sha256=%s → trusted=%v", req.SHA256, trusted)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]bool{"ok": true, "trusted": trusted})
 }
@@ -1274,7 +1323,7 @@ func (h *handler) resolveOCSP(ctx context.Context, rl reqLog, i int, cert *pki.C
 }
 
 func (h *handler) fetchWithInfo(ctx context.Context, kind fetchKind, url string) ([]byte, string, error) {
-	return inflight.do(ctx, kind, kind.name+" "+url, urlHost(url), func(fctx context.Context) ([]byte, string, error) {
+	return inflight.do(ctx, kind, kind.name+" "+url, urlEndpoint(url), func(fctx context.Context) ([]byte, string, error) {
 		req, err := http.NewRequestWithContext(fctx, http.MethodGet, url, nil)
 		if err != nil {
 			return nil, "", err
@@ -1283,16 +1332,23 @@ func (h *handler) fetchWithInfo(ctx context.Context, kind fetchKind, url string)
 	})
 }
 
-func urlHost(rawURL string) string {
-	if u, err := neturl.Parse(rawURL); err == nil {
-		return strings.ToLower(u.Hostname())
+// urlEndpoint returns scheme://host:port with the scheme's default port.
+func urlEndpoint(rawURL string) string {
+	u, err := neturl.Parse(rawURL)
+	if err != nil {
+		return rawURL
 	}
-	return rawURL
+	scheme := strings.ToLower(u.Scheme)
+	port := u.Port()
+	if port == "" {
+		port = map[string]string{"http": "80", "https": "443"}[scheme]
+	}
+	return scheme + "://" + net.JoinHostPort(strings.ToLower(u.Hostname()), port)
 }
 
 func (h *handler) postOCSP(ctx context.Context, url string, body []byte) ([]byte, error) {
 	key := "OCSP " + url + " " + store.SHA256Hex(body)
-	data, _, err := inflight.do(ctx, fetchOCSP, key, urlHost(url), func(fctx context.Context) ([]byte, string, error) {
+	data, _, err := inflight.do(ctx, fetchOCSP, key, urlEndpoint(url), func(fctx context.Context) ([]byte, string, error) {
 		req, err := http.NewRequestWithContext(fctx, http.MethodPost, url, bytes.NewReader(body))
 		if err != nil {
 			return nil, "", err
@@ -1306,7 +1362,7 @@ func (h *handler) postOCSP(ctx context.Context, url string, body []byte) ([]byte
 func (h *handler) doFetch(req *http.Request, kind fetchKind) ([]byte, string, error) {
 	resp, err := h.client.Do(req)
 	if err != nil {
-		return nil, "", fmt.Errorf("%w: %w", errUnreachable, err)
+		return nil, "", err
 	}
 	defer resp.Body.Close()
 

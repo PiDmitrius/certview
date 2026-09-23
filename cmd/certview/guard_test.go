@@ -32,7 +32,7 @@ func TestFetchFlightSharesDownload(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, _, results[i] = f.do(ctx, fetchCRL, "http://example.test/ca.crl", "example.test", fetch)
+			_, _, results[i] = f.do(ctx, fetchCRL, "CRL http://example.test/ca.crl", "http://example.test:80", fetch)
 		}()
 	}
 	time.Sleep(50 * time.Millisecond)
@@ -124,4 +124,184 @@ func TestUsableURLs(t *testing.T) {
 	if want := []string{"http://a", "HTTPS://b", "http://c"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %v, want %v", got, want)
 	}
+}
+
+func TestFetchFlightCancelsAbandonedDownload(t *testing.T) {
+	f := &fetchFlight{calls: map[string]*fetchCall{}, failed: map[string]failure{}, failTTL: time.Minute}
+	stopped := make(chan error, 1)
+	fetch := func(fctx context.Context) ([]byte, string, error) {
+		<-fctx.Done()
+		stopped <- fctx.Err()
+		return nil, "", fctx.Err()
+	}
+	ctx, leave := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		leave()
+	}()
+	if _, _, err := f.do(ctx, fetchCRL, "CRL http://example.test/a.crl", "http://example.test:80", fetch); !errors.Is(err, context.Canceled) {
+		t.Fatalf("waiter: got %v", err)
+	}
+	select {
+	case err := <-stopped:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("download stopped with %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("abandoned download kept running")
+	}
+	time.Sleep(20 * time.Millisecond)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.failed) != 0 {
+		t.Fatalf("abandoned download remembered as failure: %v", f.failed)
+	}
+}
+
+func TestCRLGateGivesSlotBack(t *testing.T) {
+	ctx, release, err := guardAnalysis(context.Background(), reqLog{id: 5})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	bigCRL <- struct{}{}
+	held := len(slots)
+	done := make(chan func())
+	go func() {
+		r, err := acquireCRLMemory(ctx, bigCRLSize)
+		if err != nil {
+			t.Error(err)
+		}
+		done <- r
+	}()
+	time.Sleep(50 * time.Millisecond)
+	if len(slots) != held-1 {
+		t.Fatalf("slots while waiting for the CRL gate: %d, want %d", len(slots), held-1)
+	}
+	<-bigCRL
+	(<-done)()
+	if len(slots) != held {
+		t.Fatalf("slots after the CRL gate: %d, want %d", len(slots), held)
+	}
+}
+
+func TestURLEndpoint(t *testing.T) {
+	for in, want := range map[string]string{
+		"http://CA.example/x.crl":     "http://ca.example:80",
+		"https://ca.example/x.crt":    "https://ca.example:443",
+		"http://ca.example:1/x":       "http://ca.example:1",
+		"http://[2001:db8::1]:8080/x": "http://[2001:db8::1]:8080",
+	} {
+		if got := urlEndpoint(in); got != want {
+			t.Errorf("%s: got %s, want %s", in, got, want)
+		}
+	}
+}
+
+func TestRespCache(t *testing.T) {
+	c := newRespCache[int](time.Minute)
+	n := 0
+	compute := func() (*int, error) { n++; v := n; return &v, nil }
+	if _, hit, _ := c.get(context.Background(), "k", compute); hit {
+		t.Fatal("first get was a hit")
+	}
+	if v, hit, _ := c.get(context.Background(), "k", compute); !hit || *v != 1 {
+		t.Fatalf("second get: hit=%v v=%d", hit, *v)
+	}
+
+	release := make(chan struct{})
+	go c.get(context.Background(), "slow", func() (*int, error) { <-release; return new(int), nil })
+	time.Sleep(20 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, _, err := c.get(ctx, "slow", compute); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("waiter behind a slow computation: got %v", err)
+	}
+	close(release)
+}
+
+func TestCRLGateKeepsSlotWhenQueueFull(t *testing.T) {
+	ctx, release, err := guardAnalysis(context.Background(), reqLog{id: 6})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	bigCRL <- struct{}{}
+	for i := 0; i < cap(crlQueue); i++ {
+		crlQueue <- struct{}{}
+	}
+	held := len(slots)
+	done := make(chan func())
+	go func() {
+		r, err := acquireCRLMemory(ctx, bigCRLSize)
+		if err != nil {
+			t.Error(err)
+		}
+		done <- r
+	}()
+	time.Sleep(50 * time.Millisecond)
+	if len(slots) != held {
+		t.Fatalf("slot given back with a full queue: %d, want %d", len(slots), held)
+	}
+	for i := 0; i < cap(crlQueue); i++ {
+		<-crlQueue
+	}
+	<-bigCRL
+	(<-done)()
+}
+
+func TestCRLGateCancelledWhileQueued(t *testing.T) {
+	ctx, release, err := guardAnalysis(context.Background(), reqLog{id: 7})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bigCRL <- struct{}{}
+	held := len(slots)
+	cctx, cancel := context.WithCancel(ctx)
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+	if _, err := acquireCRLMemory(cctx, bigCRLSize); !errors.Is(err, context.Canceled) {
+		t.Fatalf("got %v", err)
+	}
+	<-bigCRL
+	release()
+	if len(slots) != held-1 {
+		t.Fatalf("slots after cancelled wait and release: %d, want %d", len(slots), held-1)
+	}
+}
+
+func TestCRLGateNotHeldWhileWaitingForSlot(t *testing.T) {
+	ctx, release, err := guardAnalysis(context.Background(), reqLog{id: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	bigCRL <- struct{}{}
+	done := make(chan func())
+	go func() {
+		r, err := acquireCRLMemory(ctx, bigCRLSize)
+		if err != nil {
+			t.Error(err)
+		}
+		done <- r
+	}()
+	time.Sleep(50 * time.Millisecond)
+	free := cap(slots) - len(slots)
+	for i := 0; i < free; i++ {
+		slots <- struct{}{}
+	}
+	<-bigCRL
+	select {
+	case bigCRL <- struct{}{}:
+	case <-time.After(time.Second):
+		t.Fatal("gate kept while waiting for a slot")
+	}
+	for i := 0; i < free; i++ {
+		<-slots
+	}
+	time.Sleep(50 * time.Millisecond)
+	<-bigCRL
+	(<-done)()
 }

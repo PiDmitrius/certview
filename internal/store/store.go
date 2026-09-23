@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -25,6 +26,30 @@ func SHA256Hex(der []byte) string {
 
 var derTables = []string{"certs", "crls", "ocsp_responses"}
 
+// A certificate is identified by the SHA-256 of its DER: serials are unique
+// only per issuer, so trust and deduplication never go by serial.
+const certsDDL = `CREATE TABLE IF NOT EXISTS %s (
+	id               INTEGER PRIMARY KEY,
+	subject          TEXT    NOT NULL,
+	issuer           TEXT    NOT NULL,
+	serial           TEXT    NOT NULL,
+	ski              TEXT    NOT NULL DEFAULT '',
+	aki              TEXT    NOT NULL DEFAULT '',
+	subject_name_der BLOB,
+	trusted          INTEGER NOT NULL DEFAULT 0,
+	thumbprint_sha1  TEXT    NOT NULL DEFAULT '',
+	sha256           TEXT    NOT NULL DEFAULT '',
+	der              BLOB    NOT NULL,
+	is_ca            INTEGER NOT NULL DEFAULT 0,
+	is_self_signed   INTEGER NOT NULL DEFAULT 0,
+	source_url       TEXT,
+	created_at       INTEGER NOT NULL
+)`
+
+const certsColumns = "id, subject, issuer, serial, ski, aki, subject_name_der, trusted, thumbprint_sha1, sha256, der, is_ca, is_self_signed, source_url, created_at"
+
+var serialUnique = regexp.MustCompile(`serial\s+TEXT\s+NOT NULL\s+UNIQUE`)
+
 type Store struct {
 	db *sql.DB
 }
@@ -43,26 +68,10 @@ func Open(path string) (*Store, error) {
 }
 
 func (s *Store) migrate() error {
+	if _, err := s.db.Exec(fmt.Sprintf(certsDDL, "certs")); err != nil {
+		return err
+	}
 	_, err := s.db.Exec(`
-		CREATE TABLE IF NOT EXISTS certs (
-			id            INTEGER PRIMARY KEY,
-			subject       TEXT    NOT NULL,
-			issuer        TEXT    NOT NULL,
-			serial        TEXT    NOT NULL UNIQUE,
-			ski              TEXT    NOT NULL DEFAULT '',
-			aki              TEXT    NOT NULL DEFAULT '',
-			subject_name_der BLOB,
-			trusted          INTEGER NOT NULL DEFAULT 0,
-			thumbprint_sha1  TEXT    NOT NULL DEFAULT '',
-			der              BLOB   NOT NULL,
-			is_ca         INTEGER NOT NULL DEFAULT 0,
-			is_self_signed INTEGER NOT NULL DEFAULT 0,
-			source_url    TEXT,
-			created_at    INTEGER NOT NULL
-		);
-		CREATE INDEX IF NOT EXISTS idx_certs_subject ON certs(subject);
-		CREATE INDEX IF NOT EXISTS idx_certs_ski ON certs(ski);
-
 		CREATE TABLE IF NOT EXISTS crls (
 			id          INTEGER PRIMARY KEY,
 			issuer      TEXT    NOT NULL,
@@ -96,38 +105,89 @@ func (s *Store) migrate() error {
 	s.db.Exec("ALTER TABLE certs ADD COLUMN subject_name_der BLOB")
 	s.db.Exec("ALTER TABLE certs ADD COLUMN trusted INTEGER NOT NULL DEFAULT 0")
 	s.db.Exec("ALTER TABLE certs ADD COLUMN thumbprint_sha1 TEXT NOT NULL DEFAULT ''")
-	s.db.Exec("CREATE INDEX IF NOT EXISTS idx_certs_ski ON certs(ski)")
-	s.db.Exec("CREATE INDEX IF NOT EXISTS idx_certs_subject_name_der ON certs(subject_name_der)")
-	s.db.Exec("CREATE INDEX IF NOT EXISTS idx_certs_trusted ON certs(trusted)")
-	s.db.Exec("CREATE INDEX IF NOT EXISTS idx_certs_thumbprint_sha1 ON certs(thumbprint_sha1)")
-
 	for _, t := range derTables {
 		s.db.Exec("ALTER TABLE " + t + " ADD COLUMN sha256 TEXT NOT NULL DEFAULT ''")
-		if _, err := s.db.Exec("CREATE INDEX IF NOT EXISTS idx_" + t + "_sha256 ON " + t + "(sha256)"); err != nil {
-			return err
-		}
 		if err := s.backfillSHA256(t); err != nil {
 			return fmt.Errorf("backfill %s.sha256: %w", t, err)
+		}
+	}
+	if err := s.dropSerialUnique(); err != nil {
+		return fmt.Errorf("certs: drop serial uniqueness: %w", err)
+	}
+
+	for _, stmt := range []string{
+		"CREATE UNIQUE INDEX IF NOT EXISTS idx_certs_sha256 ON certs(sha256)",
+		"CREATE INDEX IF NOT EXISTS idx_crls_sha256 ON crls(sha256)",
+		"CREATE INDEX IF NOT EXISTS idx_ocsp_responses_sha256 ON ocsp_responses(sha256)",
+		"CREATE INDEX IF NOT EXISTS idx_certs_subject ON certs(subject)",
+		"CREATE INDEX IF NOT EXISTS idx_certs_serial ON certs(serial)",
+		"CREATE INDEX IF NOT EXISTS idx_certs_ski ON certs(ski)",
+		"CREATE INDEX IF NOT EXISTS idx_certs_subject_name_der ON certs(subject_name_der)",
+		"CREATE INDEX IF NOT EXISTS idx_certs_trusted ON certs(trusted)",
+		"CREATE INDEX IF NOT EXISTS idx_certs_thumbprint_sha1 ON certs(thumbprint_sha1)",
+	} {
+		if _, err := s.db.Exec(stmt); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-func (s *Store) backfillSHA256(table string) error {
-	for {
-		var id int64
-		var der []byte
-		err := s.db.QueryRow("SELECT id, der FROM "+table+" WHERE sha256 = '' LIMIT 1").Scan(&id, &der)
-		if err == sql.ErrNoRows {
-			return nil
+// dropSerialUnique rebuilds a certs table created with a UNIQUE serial.
+func (s *Store) dropSerialUnique() error {
+	var ddl string
+	if err := s.db.QueryRow("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'certs'").Scan(&ddl); err != nil {
+		return err
+	}
+	if !serialUnique.MatchString(ddl) {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, stmt := range []string{
+		fmt.Sprintf(certsDDL, "certs_new"),
+		"INSERT INTO certs_new (" + certsColumns + ") SELECT " + certsColumns + " FROM certs",
+		"DROP TABLE certs",
+		"ALTER TABLE certs_new RENAME TO certs",
+	} {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
 		}
-		if err != nil {
+	}
+	return tx.Commit()
+}
+
+func (s *Store) backfillSHA256(table string) error {
+	rows, err := s.db.Query("SELECT id FROM " + table + " WHERE sha256 = ''")
+	if err != nil {
+		return err
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, id := range ids {
+		var der []byte
+		if err := s.db.QueryRow("SELECT der FROM "+table+" WHERE id = ?", id).Scan(&der); err != nil {
 			return err
 		}
 		if _, err := s.db.Exec("UPDATE "+table+" SET sha256 = ? WHERE id = ?", SHA256Hex(der), id); err != nil {
 			return err
 		}
 	}
+	return nil
 }
 
 // FindDERBySHA256 returns a stored certificate, CRL or OCSP response by content hash.
@@ -144,6 +204,22 @@ func (s *Store) FindDERBySHA256(sha256Hex string) ([]byte, error) {
 		}
 	}
 	return nil, nil
+}
+
+// DERSize returns the size of the stored object with the hash, 0 if none.
+func (s *Store) DERSize(sha256Hex string) (int, error) {
+	sha256Hex = strings.ToUpper(sha256Hex)
+	for _, t := range derTables {
+		var n int
+		err := s.db.QueryRow("SELECT length(der) FROM "+t+" WHERE sha256 = ? LIMIT 1", sha256Hex).Scan(&n)
+		if err == nil {
+			return n, nil
+		}
+		if err != sql.ErrNoRows {
+			return 0, err
+		}
+	}
+	return 0, nil
 }
 
 func (s *Store) HasDER(sha256Hex string) bool {
@@ -323,7 +399,7 @@ func (s *Store) ImportTrustedCert(subject, issuer, serial, ski, aki string, subj
 			(subject, issuer, serial, ski, aki, subject_name_der, trusted, thumbprint_sha1, sha256, der,
 			 is_ca, is_self_signed, source_url, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(serial) DO UPDATE SET trusted = 1, source_url = excluded.source_url
+		ON CONFLICT(sha256) DO UPDATE SET trusted = 1, source_url = excluded.source_url
 		WHERE certs.source_url IS NOT excluded.source_url`,
 		subject, issuer, serial, ski, aki, subjectNameDER, sha1hex(der), SHA256Hex(der), der,
 		btoi(isCA), btoi(isSelfSigned),
@@ -336,12 +412,12 @@ func (s *Store) ImportTrustedCert(subject, issuer, serial, ski, aki string, subj
 	return n > 0, err
 }
 
-func (s *Store) SetTrusted(serial string, trusted bool) error {
+func (s *Store) SetTrusted(sha256Hex string, trusted bool) error {
 	v := 0
 	if trusted {
 		v = 1
 	}
-	res, err := s.db.Exec("UPDATE certs SET trusted = ? WHERE serial = ?", v, serial)
+	res, err := s.db.Exec("UPDATE certs SET trusted = ? WHERE sha256 = ?", v, strings.ToUpper(sha256Hex))
 	if err != nil {
 		return err
 	}
@@ -352,9 +428,9 @@ func (s *Store) SetTrusted(serial string, trusted bool) error {
 	return nil
 }
 
-func (s *Store) IsCertTrusted(serial string) (bool, error) {
+func (s *Store) IsCertTrusted(sha256Hex string) (bool, error) {
 	var trusted int
-	err := s.db.QueryRow("SELECT trusted FROM certs WHERE serial = ?", serial).Scan(&trusted)
+	err := s.db.QueryRow("SELECT trusted FROM certs WHERE sha256 = ?", strings.ToUpper(sha256Hex)).Scan(&trusted)
 	if err == sql.ErrNoRows {
 		return false, nil
 	}
