@@ -32,6 +32,8 @@ import (
 	"flag"
 	"log"
 	"net/http"
+
+	"github.com/PiDmitrius/certview/internal/limits"
 )
 
 func main() {
@@ -60,5 +62,5 @@ func main() {
 	mux.HandleFunc("POST /fetch", h.fetch)
 
 	log.Printf("certget listening on %s", *addr)
-	log.Fatal(http.ListenAndServe(*addr, mux))
+	log.Fatal(limits.ListenAndServe(*addr, mux))
 }

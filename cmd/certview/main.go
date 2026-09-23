@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -11,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/PiDmitrius/certview/internal/limits"
 	"github.com/PiDmitrius/certview/internal/pki"
 	"github.com/PiDmitrius/certview/internal/ssrfguard"
 	"github.com/PiDmitrius/certview/internal/store"
@@ -22,23 +25,31 @@ import (
 // handler both reject SSRF targets (private, loopback, link-local, multicast,
 // CGNAT, TEST-NET, etc — see internal/ssrfguard). Use it for any request
 // whose URL comes from the wire: AIA, CRL, OCSP, anything pointed at by a
-// remote certificate.
-func newGuardedHTTPClient(timeout time.Duration) *http.Client {
-	dialer := &net.Dialer{Timeout: 10 * time.Second, Control: ssrfguard.DialerControl}
+// remote certificate. A request fails when no data arrives for idle, however
+// long a slow but progressing download takes, up to the overall timeout.
+func newGuardedHTTPClient(idle, timeout time.Duration) *http.Client {
+	dialer := &net.Dialer{Timeout: 5 * time.Second, Control: ssrfguard.DialerControl}
 	return &http.Client{
 		Timeout: timeout,
-		Transport: &http.Transport{
+		Transport: idleTimeoutTransport{idle: idle, base: &http.Transport{
+			MaxIdleConns:        64,
+			MaxIdleConnsPerHost: 2,
+			IdleConnTimeout:     idle,
 			DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
 				host, _, err := net.SplitHostPort(address)
 				if err != nil {
 					return nil, err
 				}
 				if err := ssrfguard.Check(ctx, host); err != nil {
-					return nil, fmt.Errorf("ssrfguard: %w", err)
+					return nil, &unreachableError{address, fmt.Errorf("ssrfguard: %w", err)}
 				}
-				return dialer.DialContext(ctx, network, address)
+				conn, err := dialer.DialContext(ctx, network, address)
+				if err != nil {
+					return nil, &unreachableError{address, err}
+				}
+				return conn, nil
 			},
-		},
+		}},
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 10 {
 				return fmt.Errorf("too many redirects")
@@ -48,11 +59,59 @@ func newGuardedHTTPClient(timeout time.Duration) *http.Client {
 	}
 }
 
+var errIdleTimeout = errors.New("no data received within idle timeout")
+
+type idleTimeoutTransport struct {
+	idle time.Duration
+	base http.RoundTripper
+}
+
+func (t idleTimeoutTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	ctx, cancel := context.WithCancelCause(req.Context())
+	timer := time.AfterFunc(t.idle, func() { cancel(errIdleTimeout) })
+	resp, err := t.base.RoundTrip(req.WithContext(ctx))
+	if err != nil {
+		timer.Stop()
+		if context.Cause(ctx) == errIdleTimeout {
+			err = errIdleTimeout
+		}
+		cancel(nil)
+		return nil, err
+	}
+	resp.Body = &idleBody{ReadCloser: resp.Body, ctx: ctx, cancel: cancel, timer: timer, idle: t.idle}
+	return resp, nil
+}
+
+type idleBody struct {
+	io.ReadCloser
+	ctx    context.Context
+	cancel context.CancelCauseFunc
+	timer  *time.Timer
+	idle   time.Duration
+}
+
+func (b *idleBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if n > 0 {
+		b.timer.Reset(b.idle)
+	}
+	if err != nil && context.Cause(b.ctx) == errIdleTimeout {
+		err = errIdleTimeout
+	}
+	return n, err
+}
+
+func (b *idleBody) Close() error {
+	b.timer.Stop()
+	b.cancel(nil)
+	return b.ReadCloser.Close()
+}
+
 func main() {
 	addr := flag.String("addr", ":8080", "public listen address (read-only)")
 	adminAddr := flag.String("admin-addr", "", "admin listen address (with trust controls); empty to disable")
 	dbPath := flag.String("db", "certview.db", "SQLite database path")
-	siteCacheTTL := flag.Duration("site-cache-ttl", 60*time.Second, "site fetch cache TTL per (host,port,sni); 0 to disable")
+	cacheTTL := flag.Duration("cache-ttl", 60*time.Second, "how long site fetches, analyses and fetch failures are remembered; 0 to disable")
 	flag.Parse()
 
 	ctx, err := pki.Open()
@@ -71,20 +130,22 @@ func main() {
 		log.Printf("trustbundle.ImportDefaults: %v", err)
 	}
 
-	client := newGuardedHTTPClient(60 * time.Second)
+	client := newGuardedHTTPClient(30*time.Second, 10*time.Minute)
+	go runWatchdog()
 	internalClient := &http.Client{Timeout: 60 * time.Second}
 	certgetURL := os.Getenv("CERTGET_URL")
-	var pubSC, admSC *siteCache
+	// Separate caches per listener so `IsAdmin` and any other listener-specific
+	// UI hints never cross the public/admin boundary.
+	inflight.failTTL = *cacheTTL
+	pubAC := newRespCache[analyzeResponse](*cacheTTL)
+	admAC := newRespCache[analyzeResponse](*cacheTTL)
+	var pubSC, admSC *respCache[siteResponse]
 	if certgetURL != "" {
 		log.Printf("site fetch enabled via %s", certgetURL)
-		if *siteCacheTTL > 0 {
-			// Separate caches per listener so `IsAdmin` and any other
-			// listener-specific UI hints never cross the public/admin boundary.
-			pubSC = newSiteCache(*siteCacheTTL)
-			admSC = newSiteCache(*siteCacheTTL)
-			log.Printf("site cache enabled, ttl=%s", *siteCacheTTL)
-		}
+		pubSC = newRespCache[siteResponse](*cacheTTL)
+		admSC = newRespCache[siteResponse](*cacheTTL)
 	}
+	log.Printf("cache ttl=%s", *cacheTTL)
 
 	indexBytes, err := web.Static.ReadFile("index.html")
 	if err != nil {
@@ -123,30 +184,31 @@ func main() {
 	mount := func(mux *http.ServeMux, h *handler) {
 		mux.HandleFunc("POST /api/analyze", h.analyze)
 		mux.HandleFunc("GET /api/cert/{thumbprint}", h.analyzeByThumbprint)
+		mux.HandleFunc("GET /api/der/{sha256}", h.derBySHA256)
 		mux.HandleFunc("POST /api/site", h.analyzeSite)
 		mux.HandleFunc("GET /api/site/{hostport}", h.analyzeSiteByHostPort)
 		mux.HandleFunc("GET /api/config", h.config)
 		mux.Handle("/", rootHandler)
 	}
 
-	pub := &handler{ctx: ctx, store: db, client: client, isAdmin: false, certgetURL: certgetURL, siteCache: pubSC, internalClient: internalClient}
+	pub := &handler{ctx: ctx, store: db, client: client, isAdmin: false, certgetURL: certgetURL, siteCache: pubSC, analysisCache: pubAC, internalClient: internalClient}
 	pubMux := http.NewServeMux()
 	mount(pubMux, pub)
 
 	log.Printf("public listening on %s, db: %s", *addr, *dbPath)
 	go func() {
-		log.Fatal(http.ListenAndServe(*addr, pubMux))
+		log.Fatal(limits.ListenAndServe(*addr, pubMux))
 	}()
 
 	if *adminAddr != "" {
-		adm := &handler{ctx: ctx, store: db, client: client, isAdmin: true, certgetURL: certgetURL, siteCache: admSC, internalClient: internalClient}
+		adm := &handler{ctx: ctx, store: db, client: client, isAdmin: true, certgetURL: certgetURL, siteCache: admSC, analysisCache: admAC, internalClient: internalClient}
 		admMux := http.NewServeMux()
 		mount(admMux, adm)
 		admMux.HandleFunc("POST /api/trust", adm.trust)
 		admMux.HandleFunc("POST /api/untrust", adm.untrust)
 
 		log.Printf("admin listening on %s", *adminAddr)
-		log.Fatal(http.ListenAndServe(*adminAddr, admMux))
+		log.Fatal(limits.ListenAndServe(*adminAddr, admMux))
 	} else {
 		select {}
 	}

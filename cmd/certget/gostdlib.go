@@ -7,6 +7,7 @@ import (
 	"net"
 	"strconv"
 
+	"github.com/PiDmitrius/certview/internal/limits"
 	"github.com/PiDmitrius/certview/internal/ssrfguard"
 )
 
@@ -46,8 +47,8 @@ func (GoStdlibFetcher) Fetch(ctx context.Context, host, ip string, port int, sni
 
 	chain := make([][]byte, 0, len(state.PeerCertificates))
 	for _, c := range state.PeerCertificates {
-		if len(c.Raw) > MaxCertSize {
-			return nil, fmt.Errorf("cert too big: %d > %d", len(c.Raw), MaxCertSize)
+		if len(c.Raw) > limits.CertSize {
+			return nil, fmt.Errorf("cert too big: %d > %d", len(c.Raw), limits.CertSize)
 		}
 		chain = append(chain, c.Raw)
 	}

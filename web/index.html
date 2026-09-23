@@ -353,7 +353,7 @@ main {
   gap: 8px;
 }
 
-.cert-actions button {
+.cert-actions button, .cert-actions a {
   background: #fff;
   border: 1px solid var(--border);
   border-radius: 4px;
@@ -363,11 +363,12 @@ main {
   padding: 4px 10px;
   cursor: pointer;
   transition: border-color 0.15s, color 0.15s, background 0.15s;
+  text-decoration: none;
 }
 
-.cert-actions button:hover { background: #f0f6ff; border-color: var(--accent); }
+.cert-actions button:hover, .cert-actions a:hover { background: #f0f6ff; border-color: var(--accent); }
 
-.cert-actions button:hover {
+.cert-actions button:hover, .cert-actions a:hover {
   border-color: var(--accent);
   color: var(--text);
 }
@@ -581,6 +582,7 @@ async function sendFile(file) {
 }
 
 async function sendBytes(bytes) {
+  window.__rerun = () => sendBytes(bytes);
   loading.classList.add('active');
   results.classList.remove('active');
   clearError();
@@ -602,6 +604,7 @@ async function sendBytes(bytes) {
 }
 
 async function loadByThumbprint(tp) {
+  window.__rerun = () => loadByThumbprint(tp);
   loading.classList.add('active');
   results.classList.remove('active');
   clearError();
@@ -619,6 +622,7 @@ async function loadByThumbprint(tp) {
 }
 
 async function fetchSite(url) {
+  window.__rerun = () => fetchSite(url);
   loading.classList.add('active');
   results.classList.remove('active');
   clearError();
@@ -655,6 +659,7 @@ function canonicalSiteString(host, port) {
 }
 
 async function loadSiteByPath(hostport, targetThumb) {
+  window.__rerun = () => loadSiteByPath(hostport, targetThumb);
   loading.classList.add('active');
   results.classList.remove('active');
   clearError();
@@ -795,24 +800,30 @@ function copyCRLPEM(btn, b64) {
   copyToClipboard(pem, btn, 'Copy PEM');
 }
 
-function saveOCSP(b64, name) {
+function saveB64(b64, name) {
   const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
-  const blob = new Blob([bytes], { type: 'application/ocsp-response' });
   const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = name + '.ocsp';
+  a.href = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
+  a.download = name;
   a.click();
   URL.revokeObjectURL(a.href);
 }
 
-function saveCRL(b64, name) {
-  const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
-  const blob = new Blob([bytes], { type: 'application/pkix-crl' });
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = name.endsWith('.crl') ? name : name + '.crl';
-  a.click();
-  URL.revokeObjectURL(a.href);
+// Large objects arrive without der_b64: saved from /api/der/ when stored, else only the source link.
+function derActions(obj, name, sourceURL) {
+  const ext = name.slice(name.lastIndexOf('.'));
+  if (obj.der_b64) {
+    return `<button onclick="event.stopPropagation(); copyB64(this, '${jsesc(obj.der_b64)}')">Copy B64</button>
+      <button onclick="event.stopPropagation(); saveB64('${jsesc(obj.der_b64)}', '${jsesc(name)}')">Save ${esc(ext)}</button>`;
+  }
+  const size = `<span class="dn-key">${(obj.der_size / 1048576).toFixed(1)} MB</span>`;
+  if (obj.der_url) {
+    return `<a href="${esc(obj.der_url)}" download="${esc(name)}" onclick="event.stopPropagation()">Save ${esc(ext)}</a> ${size}`;
+  }
+  if (sourceURL && /^https?:\/\//i.test(sourceURL)) {
+    return `<a href="${esc(sourceURL)}" target="_blank" rel="noopener noreferrer" onclick="event.stopPropagation()">Source</a> ${size}`;
+  }
+  return size;
 }
 
 window.addEventListener('hashchange', () => {
@@ -891,7 +902,7 @@ function render(data) {
     if (cert.ekus) cert.ekus.forEach(e => { tags += ekuTag(e) + ' '; });
     // Trust only makes PKI sense for self-signed roots
     const adminBtn = (window.__isAdmin && cert.is_self_signed)
-      ? `<button onclick="event.stopPropagation(); toggleTrust(this, '${jsesc(cert.serial)}', ${cert.trusted})">${cert.trusted ? 'Untrust' : 'Trust'}</button>`
+      ? `<button onclick="event.stopPropagation(); toggleTrust(this, '${jsesc(cert.thumbprint_sha256)}', '${jsesc(cert.der_b64)}', ${cert.trusted})">${cert.trusted ? 'Untrust' : 'Trust'}</button>`
       : '';
     const firstSAN = pickFirstSAN(cert.sans);
     const sanLine = firstSAN
@@ -902,9 +913,8 @@ function render(data) {
       ${sanLine}
       <div class="cn-meta">${cert.not_before.substring(0,10)} — ${cert.not_after.substring(0,10)}${fmtRemaining(cert.not_after, cert.not_before)}</div>
       <div class="cert-actions">
-        <button onclick="event.stopPropagation(); copyB64(this, '${jsesc(cert.der_b64)}')">Copy B64</button>
-        <button onclick="event.stopPropagation(); saveDER('${jsesc(cert.der_b64)}', '${jsesc(cert.serial)}')">Save .cer</button>
-        <button onclick="event.stopPropagation(); shareLink(this, '${jsesc(cert.thumbprint_sha1)}', ${i === 0})">Link</button>
+        ${derActions(cert, cert.serial + '.cer')}
+        ${cert.stored ? `<button onclick="event.stopPropagation(); shareLink(this, '${jsesc(cert.thumbprint_sha1)}', ${i === 0})">Link</button>` : ''}
         ${adminBtn}
       </div>`;
     node.addEventListener('click', (e) => { e.stopPropagation(); selectCert(e, chain, i, 'cert'); });
@@ -920,12 +930,12 @@ function render(data) {
         const scopeTag = crl.has_idp
           ? ' <span class="tag unchecked" title="issuingDistributionPoint present — scope not analyzed, revocation may be incomplete">scope partial</span>'
           : '';
-        const fname = (crl.urls[0]||'crl').split('/').pop().replace(/[^a-zA-Z0-9_.-]/g,'_');
+        let fname = (crl.urls[0]||'crl').split('/').pop().replace(/[^a-zA-Z0-9_.-]/g,'_');
+        if (!fname.endsWith('.crl')) fname += '.crl';
         crlNode.innerHTML = `<div class="cn-tags"><span class="tag ca">CRL</span>${rev}${sigTag}${scopeTag}</div>
           <div class="crl-summary">${esc(crl.this_update).substring(0,10)} — ${esc(crl.next_update).substring(0,10)}${fmtRemaining(crl.next_update)} · ${crl.revoked_count} revoked</div>
           <div class="cert-actions">
-            <button onclick="event.stopPropagation(); copyB64(this, '${jsesc(crl.der_b64)}')">Copy B64</button>
-            <button onclick="event.stopPropagation(); saveCRL('${jsesc(crl.der_b64)}', '${jsesc(fname)}')">Save .crl</button>
+            ${derActions(crl, fname, crl.urls[0])}
           </div>`;
         crlNode.addEventListener('click', (e) => { e.stopPropagation(); selectCert(e, chain, i, 'crl', ci); });
         node.appendChild(crlNode);
@@ -950,8 +960,7 @@ function render(data) {
         ocspNode.innerHTML = `<div class="cn-tags"><span class="tag ca">OCSP</span>${statusTag}${verTag}</div>
           <div class="crl-summary">for ${fmtDNShort(ocsp.cert_subject, 2)} · ${dates}</div>
           <div class="cert-actions">
-            <button onclick="event.stopPropagation(); copyB64(this, '${jsesc(ocsp.der_b64)}')">Copy B64</button>
-            <button onclick="event.stopPropagation(); saveOCSP('${jsesc(ocsp.der_b64)}', '${jsesc(ocsp.cert_serial||'ocsp')}')">Save .ocsp</button>
+            ${derActions(ocsp, (ocsp.cert_serial||'ocsp') + '.ocsp')}
           </div>`;
         ocspNode.addEventListener('click', (e) => { e.stopPropagation(); selectCert(e, chain, i, 'ocsp', oi); });
         node.appendChild(ocspNode);
@@ -1207,7 +1216,7 @@ function copyPEM(btn, b64) {
   copyToClipboard(pem, btn, 'Copy PEM');
 }
 
-async function toggleTrust(btn, serial, currentlyTrusted) {
+async function toggleTrust(btn, sha256, derB64, currentlyTrusted) {
   const action = currentlyTrusted ? 'untrust' : 'trust';
   const orig = btn.textContent;
   btn.disabled = true;
@@ -1216,43 +1225,15 @@ async function toggleTrust(btn, serial, currentlyTrusted) {
     const resp = await fetch('/api/' + action, {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({serial: serial}),
+      body: JSON.stringify({sha256: sha256, der_b64: derB64}),
     });
     if (!resp.ok) throw new Error(await resp.text());
-
-    // Update local cert state
-    const cert = window.__lastData.chain.find(c => c.serial === serial);
-    if (cert) cert.trusted = !currentlyTrusted;
-
-    // Re-evaluate verify.trusted: walk chain top-down, find first trusted cert
-    if (window.__lastData.verify.status === 'ok') {
-      let trustedCert = null;
-      for (let i = window.__lastData.chain.length - 1; i >= 0; i--) {
-        if (window.__lastData.chain[i].trusted) {
-          trustedCert = window.__lastData.chain[i];
-          break;
-        }
-      }
-      window.__lastData.verify.trusted = !!trustedCert;
-      window.__lastData.verify.trust_via = trustedCert ? trustedCert.subject : '';
-    }
-
-    render(window.__lastData);
+    window.__rerun();
   } catch (e) {
     showError('Failed', e.message);
     btn.disabled = false;
     btn.textContent = orig;
   }
-}
-
-function saveDER(b64, serial) {
-  const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
-  const blob = new Blob([bytes], { type: 'application/pkix-cert' });
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = serial + '.cer';
-  a.click();
-  URL.revokeObjectURL(a.href);
 }
 
 function pickFirstSAN(sans) {

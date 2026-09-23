@@ -70,6 +70,7 @@ func (h *handler) config(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) analyzeSite(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
 	var req siteRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
@@ -107,31 +108,18 @@ func (h *handler) respondSite(w http.ResponseWriter, r *http.Request, host strin
 		return
 	}
 
-	// Cache + singleflight: parallel callers on the same (host,port,sni) wait
-	// for one fetch+analyze pass; fresh entries are served without certget contact.
-	var entry *siteCacheEntry
-	if h.siteCache != nil {
-		key := fmt.Sprintf("%s|%d|%s", host, port, sni)
-		entry = h.siteCache.entryFor(key)
-		entry.mu.Lock()
-		if cached := entry.fresh(); cached != nil {
-			entry.mu.Unlock()
-			respCopy := *cached
-			respCopy.Cached = true
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(respCopy)
-			return
-		}
-		defer entry.mu.Unlock()
-	}
-
-	resp, err := h.doAnalyzeSite(r.Context(), host, port, sni)
+	key := fmt.Sprintf("%s|%d|%s", host, port, sni)
+	resp, hit, err := h.siteCache.get(r.Context(), key, func() (*siteResponse, error) {
+		return h.doAnalyzeSite(r.Context(), host, port, sni)
+	})
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
+		writeAnalysisError(w, err)
 		return
 	}
-	if entry != nil {
-		entry.store(resp, h.siteCache.ttl)
+	if hit {
+		respCopy := *resp
+		respCopy.Cached = true
+		resp = &respCopy
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
@@ -139,6 +127,11 @@ func (h *handler) respondSite(w http.ResponseWriter, r *http.Request, host strin
 
 func (h *handler) doAnalyzeSite(ctx context.Context, host string, port int, sni string) (*siteResponse, error) {
 	rl := reqLog{id: reqCounter.Add(1)}
+	ctx, release, err := guardAnalysis(ctx, rl)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
 	rl.f("site: host=%s port=%d sni=%s", host, port, sni)
 
 	cgResp, err := h.callCertget(ctx, host, port, sni)
@@ -184,24 +177,20 @@ func (h *handler) doAnalyzeSite(ctx context.Context, host string, port int, sni 
 			continue
 		}
 
-		// Pre-cache intermediates so doAnalyze's resolveIssuer finds them in store.
-		sourceURL := fmt.Sprintf("tls://%s:%d?via=%s", host, port, r.Client)
+		var bag []bagCert
 		for _, der := range ders[1:] {
 			info, err := h.ctx.ParseCertInfo(der)
 			if err != nil {
 				rl.f("site: %s skip intermediate (parse): %v", r.Client, err)
 				continue
 			}
-			if err := h.store.SaveCert(
-				info.Subject, info.Issuer, info.Serial,
-				info.SKI, info.AKI, info.SubjectNameDER,
-				info.DER, info.IsCA, info.IsSelfSigned, sourceURL,
-			); err != nil {
-				rl.f("site: %s store.SaveCert intermediate: %v", r.Client, err)
-			}
+			bag = append(bag, bagCert{info, "tls"})
 		}
 
-		analysis := h.doAnalyze(ders[0])
+		analysis, err := h.analyzeData(ctx, rl, ders[0], bag)
+		if err != nil {
+			return nil, err
+		}
 		// Leaf came from TLS, not from an upload — label it for the UI.
 		if len(analysis.Chain) > 0 {
 			analysis.Chain[0].Source = "tls"
@@ -233,7 +222,7 @@ func (h *handler) callCertget(ctx context.Context, host string, port int, sni st
 		return nil, fmt.Errorf("certget HTTP %d: %s", resp.StatusCode, bytes.TrimSpace(b))
 	}
 	var cg certgetResponse
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 16<<20)).Decode(&cg); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&cg); err != nil {
 		return nil, fmt.Errorf("certget decode: %w", err)
 	}
 	return &cg, nil
