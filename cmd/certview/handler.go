@@ -24,6 +24,27 @@ import (
 
 var reqCounter atomic.Uint64
 
+// Objects larger than inlineDERMax are never embedded in API responses:
+// the UI downloads them from /api/der/{sha256} when stored, or from their source URL.
+const inlineDERMax = 256 << 10
+
+type derJSON struct {
+	B64  string `json:"der_b64,omitempty"`
+	URL  string `json:"der_url,omitempty"`
+	Size int    `json:"der_size"`
+}
+
+func (h *handler) derRef(der []byte) derJSON {
+	if len(der) <= inlineDERMax {
+		return derJSON{B64: base64.StdEncoding.EncodeToString(der), Size: len(der)}
+	}
+	ref := derJSON{Size: len(der)}
+	if sha := store.SHA256Hex(der); h.store.HasDER(sha) {
+		ref.URL = "/api/der/" + sha
+	}
+	return ref
+}
+
 type handler struct {
 	ctx            *pki.Context
 	store          *store.Store
@@ -62,8 +83,8 @@ type certJSON struct {
 	IssuedOCSPs        []ocspJSON `json:"issued_ocsps,omitempty"`
 	ThumbprintSHA1     string     `json:"thumbprint_sha1"`
 	ThumbprintSHA256   string     `json:"thumbprint_sha256"`
-	DER                string     `json:"der_b64,omitempty"`
-	Source             string     `json:"source,omitempty"`
+	derJSON
+	Source string `json:"source,omitempty"`
 }
 
 type ocspJSON struct {
@@ -76,7 +97,7 @@ type ocspJSON struct {
 	CertSubject string `json:"cert_subject"`
 	CertSerial  string `json:"cert_serial"`
 	Source      string `json:"source,omitempty"`
-	DER         string `json:"der_b64,omitempty"`
+	derJSON
 }
 
 type crlJSON struct {
@@ -91,8 +112,8 @@ type crlJSON struct {
 	SignatureStatus string   `json:"signature_status,omitempty"` // "verified" | "bad" | "unchecked"
 	SignatureMsg    string   `json:"signature_msg,omitempty"`
 	HasIDP          bool     `json:"has_idp,omitempty"`
-	DER             string   `json:"der_b64,omitempty"`
-	Errors          []string `json:"errors,omitempty"`
+	derJSON
+	Errors []string `json:"errors,omitempty"`
 }
 
 type revJSON struct {
@@ -152,7 +173,7 @@ func decodeKeyUsage(ku uint32) []string {
 	return result
 }
 
-func certToJSON(c *pki.CertInfo, source string) certJSON {
+func (h *handler) certToJSON(c *pki.CertInfo, source string) certJSON {
 	s1 := sha1.Sum(c.DER)
 	s256 := sha256.Sum256(c.DER)
 	// Cross-signed: subject == issuer at byte level, but not actually self-signed.
@@ -185,7 +206,7 @@ func certToJSON(c *pki.CertInfo, source string) certJSON {
 		CDPURLs:            c.CDPURLs,
 		ThumbprintSHA1:     strings.ToUpper(hex.EncodeToString(s1[:])),
 		ThumbprintSHA256:   strings.ToUpper(hex.EncodeToString(s256[:])),
-		DER:                base64.StdEncoding.EncodeToString(c.DER),
+		derJSON:            h.derRef(c.DER),
 		Source:             source,
 	}
 }
@@ -482,8 +503,8 @@ func (h *handler) doAnalyze(data []byte) *analyzeResponse {
 					RevokedCount: crlInfo.RevokedCount,
 					CertRevoked:  revoked, Source: source,
 					SignatureStatus: sigStatus, SignatureMsg: sigMsg,
-					HasIDP: crlInfo.HasIDP,
-					DER:    base64.StdEncoding.EncodeToString(crlDER),
+					HasIDP:  crlInfo.HasIDP,
+					derJSON: h.derRef(crlDER),
 				})
 				if authoritative {
 					crlDERs = append(crlDERs, crlDER)
@@ -491,15 +512,27 @@ func (h *handler) doAnalyze(data []byte) *analyzeResponse {
 			}
 		}
 
+		// CDP URLs are mirrors: the first authoritative CRL decides, cached copies first.
 		var fetchErrors []string
 		for _, url := range entry.info.CDPURLs {
-			crlDER, crlInfo, source, err := h.resolveCRL(rl, url)
+			if crlChecked {
+				break
+			}
+			if crlDER, crlInfo := h.cachedCRL(rl, url); crlDER != nil {
+				processCRL(crlDER, crlInfo, "cache", url)
+			}
+		}
+		for _, url := range entry.info.CDPURLs {
+			if crlChecked {
+				break
+			}
+			crlDER, crlInfo, err := h.fetchCRL(rl, url)
 			if err != nil {
 				rl.f("crl[%d]: FAILED url=%s err=%v", i, url, err)
 				fetchErrors = append(fetchErrors, fmt.Sprintf("%s: %v", url, err))
 				continue
 			}
-			processCRL(crlDER, crlInfo, source, url)
+			processCRL(crlDER, crlInfo, "fetched", url)
 		}
 
 		// Fallback: if no CRL found via CDPs, try store lookup by issuer
@@ -548,7 +581,7 @@ func (h *handler) doAnalyze(data []byte) *analyzeResponse {
 					CertSubject: entry.info.Subject,
 					CertSerial:  entry.info.Serial,
 					Source:      source,
-					DER:         base64.StdEncoding.EncodeToString(ocspRes.DER),
+					derJSON:     h.derRef(ocspRes.DER),
 				}
 				if !ocspRes.ThisUpdate.IsZero() {
 					oj.ThisUpdate = ocspRes.ThisUpdate.Format(time.RFC3339)
@@ -695,7 +728,7 @@ func (h *handler) doAnalyze(data []byte) *analyzeResponse {
 	}
 
 	for i, entry := range chain {
-		cj := certToJSON(entry.info, entry.source)
+		cj := h.certToJSON(entry.info, entry.source)
 		if certRevocations[i].status != "" {
 			cj.Revocation = &revJSON{
 				Status: certRevocations[i].status,
@@ -731,7 +764,7 @@ func (h *handler) doAnalyzeCRL(rl reqLog, start time.Time, data []byte, crlInfo 
 		RevokedCount: crlInfo.RevokedCount,
 		HasIDP:       crlInfo.HasIDP,
 		Source:       "upload",
-		DER:          base64.StdEncoding.EncodeToString(data),
+		derJSON:      h.derRef(data),
 	}
 
 	// Freshness check
@@ -779,7 +812,7 @@ func (h *handler) doAnalyzeCRL(rl reqLog, start time.Time, data []byte, crlInfo 
 			}
 			rl.f("CRL signature check failed: %v", err)
 
-			cj := certToJSON(caInfo, "cache")
+			cj := h.certToJSON(caInfo, "cache")
 			if t, _ := h.store.IsCertTrusted(caInfo.Serial); t {
 				cj.Trusted = true
 			}
@@ -802,8 +835,9 @@ func (h *handler) doAnalyzeCRL(rl reqLog, start time.Time, data []byte, crlInfo 
 		} else {
 			rl.f("uploaded CRL saved to store: issuer=%q next=%s", crlInfo.Issuer, nextFmt)
 		}
+		crlJ.derJSON = h.derRef(data)
 
-		cj := certToJSON(caInfo, "cache")
+		cj := h.certToJSON(caInfo, "cache")
 		if t, _ := h.store.IsCertTrusted(caInfo.Serial); t {
 			cj.Trusted = true
 		}
@@ -964,35 +998,50 @@ func (h *handler) resolveIssuer(rl reqLog, cert *pki.CertInfo, resp *analyzeResp
 	return nil, ""
 }
 
-func (h *handler) resolveCRL(rl reqLog, url string) ([]byte, *pki.CRLInfo, string, error) {
-	// 1. Check store
-	if der, err := h.store.FindFreshCRL(url); err == nil && der != nil {
-		rl.f("  crl cache: %s → HIT", url)
-		info, err := h.ctx.ParseCRLInfo(der)
-		if err == nil {
-			return der, info, "cache", nil
-		}
-		rl.f("  crl cache: hit but parse failed: %v", err)
-	} else {
+func (h *handler) cachedCRL(rl reqLog, url string) ([]byte, *pki.CRLInfo) {
+	der, err := h.store.FindFreshCRL(url)
+	if err != nil || der == nil {
 		rl.f("  crl cache: %s → miss", url)
+		return nil, nil
 	}
+	rl.f("  crl cache: %s → HIT", url)
+	info, err := h.ctx.ParseCRLInfo(der)
+	if err != nil {
+		rl.f("  crl cache: hit but parse failed: %v", err)
+		return nil, nil
+	}
+	return der, info
+}
 
-	// 2. Fetch
+// fetchCRL does not persist: processCRL saves only after signature verification.
+func (h *handler) fetchCRL(rl reqLog, url string) ([]byte, *pki.CRLInfo, error) {
 	rl.f("  crl fetch: %s", url)
 	der, contentType, err := h.fetchWithInfo(url)
 	if err != nil {
-		return nil, nil, "", err
+		return nil, nil, err
 	}
 	rl.f("  crl fetch: %d bytes, content-type=%s", len(der), contentType)
 
 	info, err := h.ctx.ParseCRLInfo(der)
 	if err != nil {
-		return nil, nil, "", fmt.Errorf("parse CRL: %w", err)
+		return nil, nil, fmt.Errorf("parse CRL: %w", err)
 	}
+	return der, info, nil
+}
 
-	// Do NOT persist here — caller (processCRL) decides whether to cache
-	// after signature verification against the issuer CA.
-	return der, info, "fetched", nil
+func (h *handler) derBySHA256(w http.ResponseWriter, r *http.Request) {
+	der, err := h.store.FindDERBySHA256(r.PathValue("sha256"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if der == nil {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	w.Write(der)
 }
 
 func (h *handler) analyzeByThumbprint(w http.ResponseWriter, r *http.Request) {

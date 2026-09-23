@@ -2,6 +2,7 @@ package store
 
 import (
 	"crypto/sha1"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"fmt"
@@ -15,6 +16,14 @@ func sha1hex(der []byte) string {
 	s := sha1.Sum(der)
 	return strings.ToUpper(hex.EncodeToString(s[:]))
 }
+
+// SHA256Hex is the content address used by FindDERBySHA256.
+func SHA256Hex(der []byte) string {
+	s := sha256.Sum256(der)
+	return strings.ToUpper(hex.EncodeToString(s[:]))
+}
+
+var derTables = []string{"certs", "crls", "ocsp_responses"}
 
 type Store struct {
 	db *sql.DB
@@ -92,7 +101,60 @@ func (s *Store) migrate() error {
 	s.db.Exec("CREATE INDEX IF NOT EXISTS idx_certs_trusted ON certs(trusted)")
 	s.db.Exec("CREATE INDEX IF NOT EXISTS idx_certs_thumbprint_sha1 ON certs(thumbprint_sha1)")
 
+	for _, t := range derTables {
+		s.db.Exec("ALTER TABLE " + t + " ADD COLUMN sha256 TEXT NOT NULL DEFAULT ''")
+		if _, err := s.db.Exec("CREATE INDEX IF NOT EXISTS idx_" + t + "_sha256 ON " + t + "(sha256)"); err != nil {
+			return err
+		}
+		if err := s.backfillSHA256(t); err != nil {
+			return fmt.Errorf("backfill %s.sha256: %w", t, err)
+		}
+	}
 	return nil
+}
+
+func (s *Store) backfillSHA256(table string) error {
+	for {
+		var id int64
+		var der []byte
+		err := s.db.QueryRow("SELECT id, der FROM "+table+" WHERE sha256 = '' LIMIT 1").Scan(&id, &der)
+		if err == sql.ErrNoRows {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if _, err := s.db.Exec("UPDATE "+table+" SET sha256 = ? WHERE id = ?", SHA256Hex(der), id); err != nil {
+			return err
+		}
+	}
+}
+
+// FindDERBySHA256 returns a stored certificate, CRL or OCSP response by content hash.
+func (s *Store) FindDERBySHA256(sha256Hex string) ([]byte, error) {
+	sha256Hex = strings.ToUpper(sha256Hex)
+	for _, t := range derTables {
+		var der []byte
+		err := s.db.QueryRow("SELECT der FROM "+t+" WHERE sha256 = ? LIMIT 1", sha256Hex).Scan(&der)
+		if err == nil {
+			return der, nil
+		}
+		if err != sql.ErrNoRows {
+			return nil, err
+		}
+	}
+	return nil, nil
+}
+
+func (s *Store) HasDER(sha256Hex string) bool {
+	sha256Hex = strings.ToUpper(sha256Hex)
+	for _, t := range derTables {
+		var one int
+		if s.db.QueryRow("SELECT 1 FROM "+t+" WHERE sha256 = ? LIMIT 1", sha256Hex).Scan(&one) == nil {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Store) Close() error {
@@ -164,10 +226,10 @@ func (s *Store) FindCertBySubject(subject string) ([]byte, error) {
 func (s *Store) SaveCert(subject, issuer, serial, ski, aki string, subjectNameDER, der []byte, isCA, isSelfSigned bool, sourceURL string) error {
 	_, err := s.db.Exec(`
 		INSERT OR IGNORE INTO certs
-			(subject, issuer, serial, ski, aki, subject_name_der, thumbprint_sha1, der,
+			(subject, issuer, serial, ski, aki, subject_name_der, thumbprint_sha1, sha256, der,
 			 is_ca, is_self_signed, source_url, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		subject, issuer, serial, ski, aki, subjectNameDER, sha1hex(der), der,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		subject, issuer, serial, ski, aki, subjectNameDER, sha1hex(der), SHA256Hex(der), der,
 		btoi(isCA), btoi(isSelfSigned),
 		sourceURL, time.Now().Unix(),
 	)
@@ -225,9 +287,9 @@ func (s *Store) SaveCRL(issuer, url string, der []byte, thisUpdate, nextUpdate t
 	}
 	_, err := s.db.Exec(`
 		INSERT OR REPLACE INTO crls
-			(issuer, url, der, this_update, next_update, created_at)
-		VALUES (?, ?, ?, ?, ?, ?)`,
-		issuer, url, der,
+			(issuer, url, sha256, der, this_update, next_update, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		issuer, url, SHA256Hex(der), der,
 		thisUpdate.Unix(), nextUpdate.Unix(),
 		time.Now().Unix(),
 	)
@@ -237,11 +299,11 @@ func (s *Store) SaveCRL(issuer, url string, der []byte, thisUpdate, nextUpdate t
 func (s *Store) ImportTrustedCert(subject, issuer, serial, ski, aki string, subjectNameDER, der []byte, isCA, isSelfSigned bool, sourceURL string) error {
 	_, err := s.db.Exec(`
 		INSERT INTO certs
-			(subject, issuer, serial, ski, aki, subject_name_der, trusted, thumbprint_sha1, der,
+			(subject, issuer, serial, ski, aki, subject_name_der, trusted, thumbprint_sha1, sha256, der,
 			 is_ca, is_self_signed, source_url, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(serial) DO UPDATE SET trusted = 1, thumbprint_sha1 = excluded.thumbprint_sha1`,
-		subject, issuer, serial, ski, aki, subjectNameDER, sha1hex(der), der,
+		subject, issuer, serial, ski, aki, subjectNameDER, sha1hex(der), SHA256Hex(der), der,
 		btoi(isCA), btoi(isSelfSigned),
 		sourceURL, time.Now().Unix(),
 	)
@@ -311,10 +373,10 @@ func (s *Store) SaveOCSP(certThumbprint, responderURL, status string, der []byte
 	_, err := s.db.Exec(`
 		INSERT INTO ocsp_responses
 			(cert_thumbprint, responder_url, status, this_update, next_update,
-			 produced_at, der, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			 produced_at, sha256, der, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		strings.ToUpper(certThumbprint), responderURL, status,
-		thisUpdate.Unix(), nextU, producedAt.Unix(), der, time.Now().Unix(),
+		thisUpdate.Unix(), nextU, producedAt.Unix(), SHA256Hex(der), der, time.Now().Unix(),
 	)
 	return err
 }

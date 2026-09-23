@@ -23,7 +23,7 @@ ENV LD_LIBRARY_PATH=/opt/openssl/lib
 WORKDIR /app
 COPY . .
 RUN go mod tidy \
-    && go test ./cmd/certview ./internal/dnshost \
+    && go test ./cmd/certview ./internal/dnshost ./internal/store \
     && go build -o /certview ./cmd/certview
 
 # Stage 3: Runtime with shared OpenSSL + GOST engine

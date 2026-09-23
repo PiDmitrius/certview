@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -22,12 +24,13 @@ import (
 // handler both reject SSRF targets (private, loopback, link-local, multicast,
 // CGNAT, TEST-NET, etc — see internal/ssrfguard). Use it for any request
 // whose URL comes from the wire: AIA, CRL, OCSP, anything pointed at by a
-// remote certificate.
-func newGuardedHTTPClient(timeout time.Duration) *http.Client {
+// remote certificate. A request fails when no data arrives for idle, however
+// long a slow but progressing download takes, up to the overall timeout.
+func newGuardedHTTPClient(idle, timeout time.Duration) *http.Client {
 	dialer := &net.Dialer{Timeout: 10 * time.Second, Control: ssrfguard.DialerControl}
 	return &http.Client{
 		Timeout: timeout,
-		Transport: &http.Transport{
+		Transport: idleTimeoutTransport{idle: idle, base: &http.Transport{
 			DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
 				host, _, err := net.SplitHostPort(address)
 				if err != nil {
@@ -38,7 +41,7 @@ func newGuardedHTTPClient(timeout time.Duration) *http.Client {
 				}
 				return dialer.DialContext(ctx, network, address)
 			},
-		},
+		}},
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 10 {
 				return fmt.Errorf("too many redirects")
@@ -46,6 +49,54 @@ func newGuardedHTTPClient(timeout time.Duration) *http.Client {
 			return ssrfguard.Check(req.Context(), req.URL.Hostname())
 		},
 	}
+}
+
+var errIdleTimeout = errors.New("no data received within idle timeout")
+
+type idleTimeoutTransport struct {
+	idle time.Duration
+	base http.RoundTripper
+}
+
+func (t idleTimeoutTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	ctx, cancel := context.WithCancelCause(req.Context())
+	timer := time.AfterFunc(t.idle, func() { cancel(errIdleTimeout) })
+	resp, err := t.base.RoundTrip(req.WithContext(ctx))
+	if err != nil {
+		timer.Stop()
+		if context.Cause(ctx) == errIdleTimeout {
+			err = errIdleTimeout
+		}
+		cancel(nil)
+		return nil, err
+	}
+	resp.Body = &idleBody{ReadCloser: resp.Body, ctx: ctx, cancel: cancel, timer: timer, idle: t.idle}
+	return resp, nil
+}
+
+type idleBody struct {
+	io.ReadCloser
+	ctx    context.Context
+	cancel context.CancelCauseFunc
+	timer  *time.Timer
+	idle   time.Duration
+}
+
+func (b *idleBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if n > 0 {
+		b.timer.Reset(b.idle)
+	}
+	if err != nil && context.Cause(b.ctx) == errIdleTimeout {
+		err = errIdleTimeout
+	}
+	return n, err
+}
+
+func (b *idleBody) Close() error {
+	b.timer.Stop()
+	b.cancel(nil)
+	return b.ReadCloser.Close()
 }
 
 func main() {
@@ -71,7 +122,7 @@ func main() {
 		log.Printf("trustbundle.ImportDefaults: %v", err)
 	}
 
-	client := newGuardedHTTPClient(60 * time.Second)
+	client := newGuardedHTTPClient(30*time.Second, 10*time.Minute)
 	internalClient := &http.Client{Timeout: 60 * time.Second}
 	certgetURL := os.Getenv("CERTGET_URL")
 	var pubSC, admSC *siteCache
@@ -123,6 +174,7 @@ func main() {
 	mount := func(mux *http.ServeMux, h *handler) {
 		mux.HandleFunc("POST /api/analyze", h.analyze)
 		mux.HandleFunc("GET /api/cert/{thumbprint}", h.analyzeByThumbprint)
+		mux.HandleFunc("GET /api/der/{sha256}", h.derBySHA256)
 		mux.HandleFunc("POST /api/site", h.analyzeSite)
 		mux.HandleFunc("GET /api/site/{hostport}", h.analyzeSiteByHostPort)
 		mux.HandleFunc("GET /api/config", h.config)
