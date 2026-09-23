@@ -15,46 +15,37 @@ var mozillaPEM []byte
 //go:embed russian.pem
 var russianPEM []byte
 
-// ImportDefaults imports bundled CA certs as trusted roots.
-// Only self-signed certs are marked trusted; intermediates from the bundle
-// go to the regular cache (will be discovered via AIA chain anyway).
-// Idempotent — uses ON CONFLICT to avoid duplicates.
+// ImportDefaults imports bundled CA certs on every start. Self-signed certs
+// become trusted roots unless already imported from the same bundle, so an
+// admin's untrust of a bundled root survives restarts; intermediates go to the
+// regular cache.
 func ImportDefaults(ctx *pki.Context, st *store.Store) error {
-	count, err := st.CountTrusted()
-	if err != nil {
-		return err
-	}
-	if count > 0 {
-		log.Printf("trustbundle: %d trusted certs already in store, skipping import", count)
-		return nil
-	}
-
-	mozTrust, mozInter := importBundle(ctx, st, mozillaPEM, "mozilla")
-	ruTrust, ruInter := importBundle(ctx, st, russianPEM, "ru-gov")
-
-	log.Printf("trustbundle: imported %d trusted roots, %d intermediates from Mozilla bundle",
-		mozTrust, mozInter)
-	log.Printf("trustbundle: imported %d trusted roots, %d intermediates from Russian bundle",
-		ruTrust, ruInter)
+	log.Printf("trustbundle: %d new trusted roots from Mozilla bundle",
+		importBundle(ctx, st, mozillaPEM, "mozilla"))
+	log.Printf("trustbundle: %d new trusted roots from Russian bundle",
+		importBundle(ctx, st, russianPEM, "ru-gov"))
 	return nil
 }
 
-func importBundle(ctx *pki.Context, st *store.Store, data []byte, source string) (trustedCount, interCount int) {
+func importBundle(ctx *pki.Context, st *store.Store, data []byte, source string) (trustedCount int) {
 	for _, block := range splitPEM(data) {
 		info, err := ctx.ParseCertInfo(block)
 		if err != nil {
 			continue
 		}
 		if info.IsSelfSigned {
-			if err := st.ImportTrustedCert(
+			added, err := st.ImportTrustedCert(
 				info.Subject, info.Issuer, info.Serial,
 				info.SKI, info.AKI, info.SubjectNameDER,
 				info.DER, info.IsCA, info.IsSelfSigned, source,
-			); err != nil {
+			)
+			if err != nil {
 				log.Printf("trustbundle: import trusted %s: %v", info.Subject, err)
 				continue
 			}
-			trustedCount++
+			if added {
+				trustedCount++
+			}
 		} else {
 			if err := st.SaveCert(
 				info.Subject, info.Issuer, info.Serial,
@@ -62,9 +53,7 @@ func importBundle(ctx *pki.Context, st *store.Store, data []byte, source string)
 				info.DER, info.IsCA, info.IsSelfSigned, source,
 			); err != nil {
 				log.Printf("trustbundle: import intermediate %s: %v", info.Subject, err)
-				continue
 			}
-			interCount++
 		}
 	}
 	return

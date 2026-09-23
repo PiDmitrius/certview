@@ -315,18 +315,25 @@ func (s *Store) SaveCRL(issuer, url string, der []byte, thisUpdate, nextUpdate t
 	return err
 }
 
-func (s *Store) ImportTrustedCert(subject, issuer, serial, ski, aki string, subjectNameDER, der []byte, isCA, isSelfSigned bool, sourceURL string) error {
-	_, err := s.db.Exec(`
+// ImportTrustedCert trusts a bundled cert unless it was already imported from
+// the same source; reports whether it was added or newly trusted.
+func (s *Store) ImportTrustedCert(subject, issuer, serial, ski, aki string, subjectNameDER, der []byte, isCA, isSelfSigned bool, sourceURL string) (bool, error) {
+	res, err := s.db.Exec(`
 		INSERT INTO certs
 			(subject, issuer, serial, ski, aki, subject_name_der, trusted, thumbprint_sha1, sha256, der,
 			 is_ca, is_self_signed, source_url, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(serial) DO UPDATE SET trusted = 1, thumbprint_sha1 = excluded.thumbprint_sha1`,
+		ON CONFLICT(serial) DO UPDATE SET trusted = 1, source_url = excluded.source_url
+		WHERE certs.source_url IS NOT excluded.source_url`,
 		subject, issuer, serial, ski, aki, subjectNameDER, sha1hex(der), SHA256Hex(der), der,
 		btoi(isCA), btoi(isSelfSigned),
 		sourceURL, time.Now().Unix(),
 	)
-	return err
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n > 0, err
 }
 
 func (s *Store) SetTrusted(serial string, trusted bool) error {
@@ -355,12 +362,6 @@ func (s *Store) IsCertTrusted(serial string) (bool, error) {
 		return false, err
 	}
 	return trusted == 1, nil
-}
-
-func (s *Store) CountTrusted() (int, error) {
-	var n int
-	err := s.db.QueryRow("SELECT COUNT(*) FROM certs WHERE trusted = 1").Scan(&n)
-	return n, err
 }
 
 func (s *Store) FindFreshOCSP(certThumbprint string) ([]byte, error) {

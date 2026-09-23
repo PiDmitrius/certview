@@ -54,3 +54,41 @@ func TestSHA256BackfillAndLookup(t *testing.T) {
 		t.Fatal("unexpected hit for unknown sha256")
 	}
 }
+
+func TestImportTrustedCertRespectsUntrust(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "certview.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	imp := func(serial string) bool {
+		added, err := s.ImportTrustedCert("CN=R", "CN=R", serial, "", "", nil, []byte(serial), true, true, "ru-gov")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return added
+	}
+	if !imp("01") {
+		t.Fatal("new bundled root not added")
+	}
+	if err := s.SetTrusted("01", false); err != nil {
+		t.Fatal(err)
+	}
+	if imp("01") {
+		t.Fatal("re-import overrode admin untrust")
+	}
+	if trusted, _ := s.IsCertTrusted("01"); trusted {
+		t.Fatal("admin untrust lost")
+	}
+
+	if err := s.SaveCert("CN=G", "CN=G", "02", "", "", nil, []byte("02"), true, true, "http://example.test/g.crt"); err != nil {
+		t.Fatal(err)
+	}
+	if !imp("02") {
+		t.Fatal("root fetched via AIA not trusted by bundle import")
+	}
+	if trusted, _ := s.IsCertTrusted("02"); !trusted {
+		t.Fatal("bundled root not trusted")
+	}
+}
