@@ -149,17 +149,14 @@ func TestIssuerPoolExcludesUploads(t *testing.T) {
 	if err := s.SaveCert("CN=I", "CN=R", "01", "AB", "", name, []byte("uploaded lookalike"), true, false, ""); err != nil {
 		t.Fatal(err)
 	}
-	if der, _ := s.FindCertBySKI("AB"); der != nil {
-		t.Fatal("uploaded certificate offered as issuer by SKI")
-	}
-	if ders, _ := s.FindAllCertsByNameDER(name, 8); len(ders) != 0 {
-		t.Fatal("uploaded certificate offered as issuer by name")
+	if c, _ := s.FindIssuers(name, "AB", 8); len(c) != 1 || c[0].Pool {
+		t.Fatalf("uploaded certificate: got %+v, want one non-pool candidate", c)
 	}
 	if err := s.SavePoolCert("CN=I", "CN=R", "02", "AB", "", name, []byte("bundled"), true, false, "ru-gov"); err != nil {
 		t.Fatal(err)
 	}
-	if der, _ := s.FindCertBySKI("AB"); string(der) != "bundled" {
-		t.Fatalf("bundled issuer by SKI: got %q", der)
+	if c, _ := s.FindIssuers(name, "AB", 8); len(c) != 2 || !c[0].Pool || string(c[0].DER) != "bundled" {
+		t.Fatalf("bundled issuer not first in pool: %+v", c)
 	}
 }
 
@@ -223,13 +220,13 @@ func TestAnchoredJoinsPoolAndSHA256Lookup(t *testing.T) {
 	if err := s.SaveCert("CN=I", "CN=R", "05", "CD", "", name, der, true, false, "tls"); err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := s.FindCertBySKI("CD"); got != nil {
+	if c, _ := s.FindIssuers(name, "CD", 8); len(c) != 1 || c[0].Pool {
 		t.Fatal("archived certificate in the issuer pool")
 	}
 	if err := s.SavePoolCert("CN=I", "CN=R", "05", "CD", "", name, der, true, false, ""); err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := s.FindCertBySKI("CD"); !bytes.Equal(got, der) {
+	if c, _ := s.FindIssuers(name, "CD", 8); len(c) != 1 || !c[0].Pool {
 		t.Fatal("anchored CA not in the issuer pool")
 	}
 	if got, _ := s.FindCertByThumbprint(SHA256Hex(der)); !bytes.Equal(got, der) {
@@ -256,7 +253,7 @@ func TestArchiveIssuersOldestAndNewest(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	got, err := s.FindArchiveIssuers("EE", []byte("n"), 2)
+	got, err := s.FindIssuers([]byte("n"), "EE", 2)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -265,8 +262,8 @@ func TestArchiveIssuersOldestAndNewest(t *testing.T) {
 		t.Fatalf("got %d candidates, want %d", len(got), len(want))
 	}
 	for i := range want {
-		if !bytes.Equal(got[i], want[i]) {
-			t.Fatalf("candidate %d: got %v, want %v", i, got[i], want[i])
+		if !bytes.Equal(got[i].DER, want[i]) || got[i].Pool {
+			t.Fatalf("candidate %d: got %+v, want %v", i, got[i], want[i])
 		}
 	}
 }

@@ -445,7 +445,7 @@ func (h *handler) analyzeData(ctx context.Context, rl reqLog, data []byte, bag [
 		if len(entry.info.IssuerNameDER) == 0 {
 			continue
 		}
-		ders, _ := h.store.FindAllCertsByNameDER(entry.info.IssuerNameDER, maxAltCandidates)
+		ders := h.poolIssuers(entry.info.IssuerNameDER)
 		for _, der := range ders {
 			info, err := h.ctx.ParseCertInfo(der)
 			if err != nil {
@@ -855,7 +855,7 @@ func (h *handler) doAnalyzeCRL(rl reqLog, start time.Time, data []byte, crl *pki
 	// Only then persist CRL — an unverified CRL must not poison the store.
 	var caInfo *pki.CertInfo
 	if len(crlInfo.IssuerNameDER) > 0 {
-		ders, _ := h.store.FindAllCertsByNameDER(crlInfo.IssuerNameDER, maxAltCandidates)
+		ders := h.poolIssuers(crlInfo.IssuerNameDER)
 		for _, der := range ders {
 			info, err := h.ctx.ParseCertInfo(der)
 			if err != nil {
@@ -967,8 +967,19 @@ func (h *handler) trustedPath(der []byte, roots, intermediates [][]byte) (string
 	return vr.Chain[len(vr.Chain)-1].Subject, true
 }
 
-// archive stores a certificate seen in an analysis; archived certificates
-// are found only by thumbprint.
+// poolIssuers returns the pool certificates named nameDER.
+func (h *handler) poolIssuers(nameDER []byte) [][]byte {
+	cands, _ := h.store.FindIssuers(nameDER, "", maxAltCandidates)
+	var ders [][]byte
+	for _, c := range cands {
+		if c.Pool {
+			ders = append(ders, c.DER)
+		}
+	}
+	return ders
+}
+
+// archive stores a certificate seen in an analysis.
 func (h *handler) archive(rl reqLog, c *pki.CertInfo, source string) {
 	if err := h.store.SaveCert(c.Subject, c.Issuer, c.Serial, c.SKI, c.AKI, c.SubjectNameDER,
 		c.DER, c.IsCA, c.IsSelfSigned, source); err != nil {
@@ -992,7 +1003,7 @@ func (h *handler) chainsToTrust(cert *pki.CertInfo) bool {
 			continue
 		}
 		seen[string(name)] = true
-		ders, _ := h.store.FindAllCertsByNameDER(name, maxAltCandidates)
+		ders := h.poolIssuers(name)
 		for _, der := range ders {
 			info, err := h.ctx.ParseCertInfo(der)
 			if err != nil {
@@ -1023,21 +1034,6 @@ type bagCert struct {
 }
 
 func (h *handler) resolveIssuer(ctx context.Context, rl reqLog, cert *pki.CertInfo, resp *analyzeResponse, bag *[]bagCert) (*pki.CertInfo, string) {
-	// Validate that a candidate issuer actually matches: SKI must equal cert's AKI
-	tryCandidate := func(der []byte, hint string) *pki.CertInfo {
-		info, err := h.ctx.ParseCertInfo(der)
-		if err != nil {
-			rl.f("  cache: %s parse failed: %v", hint, err)
-			return nil
-		}
-		if cert.AKI != "" && info.SKI != "" && cert.AKI != info.SKI {
-			rl.f("  cache: %s SKI=%s ≠ AKI=%s — wrong cert, skipping",
-				hint, info.SKI, cert.AKI)
-			return nil
-		}
-		return info
-	}
-
 	// 1. Certificates this analysis already holds
 	for _, c := range *bag {
 		if (cert.AKI != "" && c.info.SKI == cert.AKI) ||
@@ -1047,45 +1043,29 @@ func (h *handler) resolveIssuer(ctx context.Context, rl reqLog, cert *pki.CertIn
 		}
 	}
 
-	// 2. Trusted pool: AKI → SKI
-	if cert.AKI != "" {
-		if der, err := h.store.FindCertBySKI(cert.AKI); err == nil && der != nil {
-			rl.f("  cache: SKI=%s → HIT", cert.AKI)
-			if info := tryCandidate(der, "SKI"); info != nil {
-				return info, "cache"
-			}
-		} else {
-			rl.f("  cache: SKI=%s → miss", cert.AKI)
-		}
+	// 2. The pool; other archived matches are kept for after AIA
+	var archived []*pki.CertInfo
+	cands, err := h.store.FindIssuers(cert.IssuerNameDER, cert.AKI, archiveSample)
+	if err != nil {
+		rl.f("  store: %v", err)
 	}
-
-	// 3. Trusted pool: DER name
-	if len(cert.IssuerNameDER) > 0 {
-		if der, err := h.store.FindCertByNameDER(cert.IssuerNameDER); err == nil && der != nil {
-			rl.f("  cache: NameDER → HIT")
-			if info := tryCandidate(der, "NameDER"); info != nil {
-				return info, "cache"
-			}
-		} else {
-			rl.f("  cache: NameDER → miss")
+	for _, c := range cands {
+		info, err := h.ctx.ParseCertInfo(c.DER)
+		if err != nil {
+			continue
 		}
-	}
-
-	// 4. Trusted pool: string subject
-	if der, err := h.store.FindCertBySubject(cert.Issuer); err == nil && der != nil {
-		rl.f("  cache: subject=%q → HIT", cert.Issuer)
-		if info := tryCandidate(der, "subject"); info != nil {
+		if c.Pool {
+			rl.f("  pool: matched %q", info.Subject)
 			return info, "cache"
 		}
-	} else {
-		rl.f("  cache: subject=%q → miss", cert.Issuer)
+		archived = append(archived, info)
 	}
 
-	// 5. Fetch via AIA
+	// 3. Fetch via AIA
 	if len(cert.AIAURLs) == 0 {
 		rl.f("  NO AIA URLs")
 		resp.Warnings = append(resp.Warnings, "No AIA URL in: "+cert.Subject)
-		return h.archiveIssuer(rl, cert, resp, bag)
+		return h.archiveIssuer(rl, cert, resp, bag, archived)
 	}
 
 	for _, url := range usableURLs(cert.AIAURLs, maxAIAURLs) {
@@ -1156,27 +1136,18 @@ func (h *handler) resolveIssuer(ctx context.Context, rl reqLog, cert *pki.CertIn
 		}
 	}
 
-	return h.archiveIssuer(rl, cert, resp, bag)
+	return h.archiveIssuer(rl, cert, resp, bag, archived)
 }
 
-// archiveIssuer is the last resort: a sample of archived certificates whose
-// subject is cert's issuer and whose SKI is cert's AKI (when cert has one)
-// joins the bag, and the one currently valid, else the oldest, is taken.
-func (h *handler) archiveIssuer(rl reqLog, cert *pki.CertInfo, resp *analyzeResponse, bag *[]bagCert) (*pki.CertInfo, string) {
-	ders, err := h.store.FindArchiveIssuers(cert.AKI, cert.IssuerNameDER, archiveSample)
-	if err != nil {
-		rl.f("  archive: %v", err)
-	}
+// archiveIssuer is the last resort: the archived candidates join the bag,
+// and the one currently valid, else the oldest, is taken.
+func (h *handler) archiveIssuer(rl reqLog, cert *pki.CertInfo, resp *analyzeResponse, bag *[]bagCert, archived []*pki.CertInfo) (*pki.CertInfo, string) {
 	var pick *pki.CertInfo
 	now := time.Now()
-	for _, der := range ders {
-		info, err := h.ctx.ParseCertInfo(der)
-		if err != nil {
-			continue
-		}
+	valid := func(c *pki.CertInfo) bool { return now.After(c.NotBefore) && now.Before(c.NotAfter) }
+	for _, info := range archived {
 		*bag = append(*bag, bagCert{info, "archive"})
-		valid := now.After(info.NotBefore) && now.Before(info.NotAfter)
-		if pick == nil || valid && !(now.After(pick.NotBefore) && now.Before(pick.NotAfter)) {
+		if pick == nil || valid(info) && !valid(pick) {
 			pick = info
 		}
 	}
@@ -1184,7 +1155,7 @@ func (h *handler) archiveIssuer(rl reqLog, cert *pki.CertInfo, resp *analyzeResp
 		resp.Warnings = append(resp.Warnings, "Could not fetch issuer for: "+cert.Subject)
 		return nil, ""
 	}
-	rl.f("  archive: %d candidate(s), picked %q", len(ders), pick.Subject)
+	rl.f("  archive: %d candidate(s), picked %q", len(archived), pick.Subject)
 	return pick, "archive"
 }
 

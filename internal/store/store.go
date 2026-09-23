@@ -28,12 +28,13 @@ var derTables = []string{"certs", "crls", "ocsp_responses"}
 
 // A certificate is identified by the SHA-256 of its DER: serials are unique
 // only per issuer, so trust and deduplication never go by serial. Every
-// certificate seen is archived. The pool of candidate issuers (poolCond) is
-// only trusted certificates and those flagged pool: bundled intermediates and
-// CAs verified on a path to a trusted root. The rest of the archive offers issuers
-// only as a last resort (FindArchiveIssuers), a bounded sample of the oldest
-// and newest matches, and never affects trust. CRLs are stored once per content, with fetch URLs mapped to it
-// in crl_urls.
+// certificate seen is archived. FindIssuers returns the candidate issuers of
+// a certificate: matches in the pool (poolCond) — trusted certificates
+// and those flagged pool, i.e. bundled intermediates and CAs verified on a
+// path to a trusted root — and a bounded sample of the oldest and newest
+// other archived matches, which callers use only as a last resort.
+// CRLs are stored once per content, with fetch URLs mapped to it in
+// crl_urls.
 const certsDDL = `CREATE TABLE IF NOT EXISTS %s (
 	id               INTEGER PRIMARY KEY,
 	subject          TEXT    NOT NULL,
@@ -145,11 +146,11 @@ func (s *Store) migrate() error {
 		"CREATE UNIQUE INDEX IF NOT EXISTS idx_crls_sha256 ON crls(sha256)",
 		"CREATE INDEX IF NOT EXISTS idx_crls_issuer ON crls(issuer)",
 		"CREATE INDEX IF NOT EXISTS idx_ocsp_responses_sha256 ON ocsp_responses(sha256)",
-		"CREATE INDEX IF NOT EXISTS idx_certs_subject ON certs(subject)",
-		"CREATE INDEX IF NOT EXISTS idx_certs_serial ON certs(serial)",
-		"CREATE INDEX IF NOT EXISTS idx_certs_ski ON certs(ski)",
+		"DROP INDEX IF EXISTS idx_certs_subject",
+		"DROP INDEX IF EXISTS idx_certs_serial",
+		"DROP INDEX IF EXISTS idx_certs_ski",
+		"DROP INDEX IF EXISTS idx_certs_trusted",
 		"CREATE INDEX IF NOT EXISTS idx_certs_subject_name_der ON certs(subject_name_der)",
-		"CREATE INDEX IF NOT EXISTS idx_certs_trusted ON certs(trusted)",
 		"CREATE INDEX IF NOT EXISTS idx_certs_thumbprint_sha1 ON certs(thumbprint_sha1)",
 	} {
 		if _, err := s.db.Exec(stmt); err != nil {
@@ -327,70 +328,6 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-func (s *Store) FindCertBySKI(ski string) ([]byte, error) {
-	if ski == "" {
-		return nil, nil
-	}
-	var der []byte
-	err := s.db.QueryRow(
-		"SELECT der FROM certs WHERE ski = ? AND "+poolCond+" ORDER BY is_self_signed DESC LIMIT 1", ski,
-	).Scan(&der)
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	return der, err
-}
-
-func (s *Store) FindCertByNameDER(subjectNameDER []byte) ([]byte, error) {
-	if len(subjectNameDER) == 0 {
-		return nil, nil
-	}
-	var der []byte
-	err := s.db.QueryRow(
-		"SELECT der FROM certs WHERE subject_name_der = ? AND "+poolCond+" ORDER BY is_self_signed DESC LIMIT 1", subjectNameDER,
-	).Scan(&der)
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	return der, err
-}
-
-// FindAllCertsByNameDER returns up to limit pool certs with the subject, trusted first.
-func (s *Store) FindAllCertsByNameDER(subjectNameDER []byte, limit int) ([][]byte, error) {
-	if len(subjectNameDER) == 0 {
-		return nil, nil
-	}
-	rows, err := s.db.Query(
-		"SELECT der FROM certs WHERE subject_name_der = ? AND "+poolCond+" ORDER BY trusted DESC, id LIMIT ?",
-		subjectNameDER, limit,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var result [][]byte
-	for rows.Next() {
-		var der []byte
-		if err := rows.Scan(&der); err != nil {
-			return nil, err
-		}
-		result = append(result, der)
-	}
-	return result, rows.Err()
-}
-
-func (s *Store) FindCertBySubject(subject string) ([]byte, error) {
-	var der []byte
-	err := s.db.QueryRow(
-		"SELECT der FROM certs WHERE subject = ? AND "+poolCond+" ORDER BY is_self_signed DESC LIMIT 1", subject,
-	).Scan(&der)
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	return der, err
-}
-
 func (s *Store) SaveCert(subject, issuer, serial, ski, aki string, subjectNameDER, der []byte, isCA, isSelfSigned bool, sourceURL string) error {
 	_, err := s.db.Exec(`
 		INSERT OR IGNORE INTO certs
@@ -518,35 +455,47 @@ func (s *Store) ImportTrustedCert(subject, issuer, serial, ski, aki string, subj
 	return n > 0, err
 }
 
-// FindArchiveIssuers returns up to n oldest and n newest archived
-// certificates with the subject and, unless ski is empty, the SKI.
-func (s *Store) FindArchiveIssuers(ski string, subjectNameDER []byte, n int) ([][]byte, error) {
+// Candidate is a stored certificate that may have issued another.
+type Candidate struct {
+	DER  []byte
+	Pool bool
+}
+
+// FindIssuers returns the certificates whose subject is issuerNameDER and,
+// unless aki is empty, whose SKI is aki: up to n pool matches (self-signed and
+// trusted first), then up to n oldest and n newest other archived matches.
+func (s *Store) FindIssuers(issuerNameDER []byte, aki string, n int) ([]Candidate, error) {
+	const match = "subject_name_der = ? AND (? = '' OR ski = ?) AND "
+	rows, err := s.db.Query(`
+		SELECT id, der, 1 FROM (SELECT id, der FROM certs WHERE `+match+poolCond+`
+			ORDER BY is_self_signed DESC, trusted DESC, id LIMIT ?)
+		UNION ALL
+		SELECT id, der, 0 FROM (SELECT id, der FROM certs WHERE `+match+`NOT `+poolCond+`
+			ORDER BY id LIMIT ?)
+		UNION ALL
+		SELECT id, der, 0 FROM (SELECT id, der FROM certs WHERE `+match+`NOT `+poolCond+`
+			ORDER BY id DESC LIMIT ?)`,
+		issuerNameDER, aki, aki, n,
+		issuerNameDER, aki, aki, n,
+		issuerNameDER, aki, aki, n)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
 	seen := map[int64]bool{}
-	var out [][]byte
-	for _, order := range []string{"ASC", "DESC"} {
-		rows, err := s.db.Query("SELECT id, der FROM certs WHERE subject_name_der = ? AND (? = '' OR ski = ?) ORDER BY id "+order+" LIMIT ?",
-			subjectNameDER, ski, ski, n)
-		if err != nil {
+	var out []Candidate
+	for rows.Next() {
+		var id int64
+		var c Candidate
+		if err := rows.Scan(&id, &c.DER, &c.Pool); err != nil {
 			return nil, err
 		}
-		for rows.Next() {
-			var id int64
-			var der []byte
-			if err := rows.Scan(&id, &der); err != nil {
-				rows.Close()
-				return nil, err
-			}
-			if !seen[id] {
-				seen[id] = true
-				out = append(out, der)
-			}
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return nil, err
+		if !seen[id] {
+			seen[id] = true
+			out = append(out, c)
 		}
 	}
-	return out, nil
+	return out, rows.Err()
 }
 
 // SavePoolCert stores a candidate issuer: a bundled intermediate or a CA
