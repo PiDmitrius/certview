@@ -109,7 +109,7 @@ func (h *handler) respondSite(w http.ResponseWriter, r *http.Request, host strin
 
 	// Cache + singleflight: parallel callers on the same (host,port,sni) wait
 	// for one fetch+analyze pass; fresh entries are served without certget contact.
-	var entry *siteCacheEntry
+	var entry *respCacheEntry[siteResponse]
 	if h.siteCache != nil {
 		key := fmt.Sprintf("%s|%d|%s", host, port, sni)
 		entry = h.siteCache.entryFor(key)
@@ -127,7 +127,7 @@ func (h *handler) respondSite(w http.ResponseWriter, r *http.Request, host strin
 
 	resp, err := h.doAnalyzeSite(r.Context(), host, port, sni)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
+		writeAnalysisError(w, err)
 		return
 	}
 	if entry != nil {
@@ -201,7 +201,10 @@ func (h *handler) doAnalyzeSite(ctx context.Context, host string, port int, sni 
 			}
 		}
 
-		analysis := h.doAnalyze(ders[0])
+		analysis, err := h.doAnalyze(ctx, ders[0])
+		if err != nil {
+			return nil, err
+		}
 		// Leaf came from TLS, not from an upload — label it for the UI.
 		if len(analysis.Chain) > 0 {
 			analysis.Chain[0].Source = "tls"
@@ -233,7 +236,7 @@ func (h *handler) callCertget(ctx context.Context, host string, port int, sni st
 		return nil, fmt.Errorf("certget HTTP %d: %s", resp.StatusCode, bytes.TrimSpace(b))
 	}
 	var cg certgetResponse
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 16<<20)).Decode(&cg); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&cg); err != nil {
 		return nil, fmt.Errorf("certget decode: %w", err)
 	}
 	return &cg, nil

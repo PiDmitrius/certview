@@ -10,6 +10,8 @@ import (
 	"regexp"
 	"strconv"
 	"sync"
+
+	"github.com/PiDmitrius/certview/internal/limits"
 )
 
 type OpensslGostFetcher struct{}
@@ -39,6 +41,7 @@ func (OpensslGostFetcher) Available() bool {
 }
 
 // Stable line emitted by s_client right after the handshake, e.g.:
+//
 //	New, TLSv1.3, Cipher is TLS_AES_256_GCM_SHA384
 //	New, TLSv1.2, Cipher is GOST2012-KUZNYECHIK-KUZNYECHIKOMAC
 var rxNewCipher = regexp.MustCompile(`(?m)^New, (TLS\S+), Cipher is (\S+)`)
@@ -84,8 +87,8 @@ func (OpensslGostFetcher) Fetch(ctx context.Context, host, ip string, port int, 
 		if block.Type != "CERTIFICATE" {
 			continue
 		}
-		if len(block.Bytes) > MaxCertSize {
-			return nil, fmt.Errorf("cert too big: %d > %d", len(block.Bytes), MaxCertSize)
+		if len(block.Bytes) > limits.CertSize {
+			return nil, fmt.Errorf("cert too big: %d > %d", len(block.Bytes), limits.CertSize)
 		}
 		chain = append(chain, block.Bytes)
 		if len(chain) > MaxChainLen {

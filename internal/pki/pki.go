@@ -3,6 +3,7 @@ package pki
 /*
 #include <minipki.h>
 #include <stdlib.h>
+#include <malloc.h>
 */
 import "C"
 import (
@@ -167,10 +168,9 @@ type CRLInfo struct {
 	NextUpdate    time.Time
 	RevokedCount  int
 	HasIDP        bool
-	DER           []byte
 }
 
-// ErrCRLBadSignature is returned by VerifyCRL when CRL signature does not
+// ErrCRLBadSignature is returned by CRL.Verify when CRL signature does not
 // validate against the provided issuer's public key.
 var ErrCRLBadSignature = errors.New("CRL signature verification failed")
 
@@ -431,7 +431,14 @@ func (ctx *Context) ParseAllCerts(data []byte) ([][]byte, error) {
 	return result, nil
 }
 
-func (ctx *Context) ParseCRLInfo(data []byte) (*CRLInfo, error) {
+// CRL is a parsed CRL. Parse once per request and Close when done: large
+// CRLs cost seconds of CPU per parse.
+type CRL struct {
+	c    C.MP_CRL
+	Info *CRLInfo
+}
+
+func (ctx *Context) ParseCRL(data []byte) (*CRL, error) {
 	if len(data) == 0 {
 		return nil, errors.New("empty CRL data")
 	}
@@ -444,7 +451,6 @@ func (ctx *Context) ParseCRLInfo(data []byte) (*CRLInfo, error) {
 	if rc != C.MP_OK {
 		return nil, rcError("mp_crl_parse", rc)
 	}
-	defer C.mp_crl_close(crl)
 
 	info := &CRLInfo{}
 	var out *C.uint8_t
@@ -483,18 +489,21 @@ func (ctx *Context) ParseCRLInfo(data []byte) (*CRLInfo, error) {
 		info.HasIDP = hasIDP == 1
 	}
 
-	info.DER = make([]byte, len(data))
-	copy(info.DER, data)
-
-	return info, nil
+	return &CRL{c: crl, Info: info}, nil
 }
 
-// VerifyCRL checks CRL signature against issuer's public key.
-// Returns ErrCRLBadSignature if signature is invalid, other errors on
-// parse/internal failure, nil on success.
-func (ctx *Context) VerifyCRL(crlDER, issuerDER []byte) error {
-	if len(crlDER) == 0 || len(issuerDER) == 0 {
-		return errors.New("empty CRL or issuer data")
+// Close frees the CRL and returns the freed heap to the OS: a parsed large
+// CRL is hundreds of MB that malloc would otherwise keep in its arena.
+func (crl *CRL) Close() {
+	C.mp_crl_close(crl.c)
+	C.malloc_trim(0)
+}
+
+// Verify checks the CRL signature against the issuer's public key.
+// Returns ErrCRLBadSignature if the signature is invalid.
+func (crl *CRL) Verify(ctx *Context, issuerDER []byte) error {
+	if len(issuerDER) == 0 {
+		return errors.New("empty issuer data")
 	}
 
 	var issuer C.MP_CERT
@@ -507,17 +516,7 @@ func (ctx *Context) VerifyCRL(crlDER, issuerDER []byte) error {
 	}
 	defer C.mp_cert_close(issuer)
 
-	var crl C.MP_CRL
-	rc = C.mp_crl_parse(ctx.c,
-		(*C.uint8_t)(unsafe.Pointer(&crlDER[0])),
-		C.size_t(len(crlDER)),
-		&crl)
-	if rc != C.MP_OK {
-		return rcError("mp_crl_parse", rc)
-	}
-	defer C.mp_crl_close(crl)
-
-	rc = C.mp_crl_verify(crl, issuer)
+	rc = C.mp_crl_verify(crl.c, issuer)
 	switch rc {
 	case C.MP_OK:
 		return nil
@@ -528,9 +527,9 @@ func (ctx *Context) VerifyCRL(crlDER, issuerDER []byte) error {
 	}
 }
 
-func (ctx *Context) CheckRevocation(certDER, crlDER []byte) (bool, error) {
-	if len(certDER) == 0 || len(crlDER) == 0 {
-		return false, errors.New("empty data")
+func (crl *CRL) IsRevoked(ctx *Context, certDER []byte) (bool, error) {
+	if len(certDER) == 0 {
+		return false, errors.New("empty certificate data")
 	}
 
 	var cert C.MP_CERT
@@ -543,18 +542,8 @@ func (ctx *Context) CheckRevocation(certDER, crlDER []byte) (bool, error) {
 	}
 	defer C.mp_cert_close(cert)
 
-	var crl C.MP_CRL
-	rc = C.mp_crl_parse(ctx.c,
-		(*C.uint8_t)(unsafe.Pointer(&crlDER[0])),
-		C.size_t(len(crlDER)),
-		&crl)
-	if rc != C.MP_OK {
-		return false, rcError("mp_crl_parse", rc)
-	}
-	defer C.mp_crl_close(crl)
-
 	var result C.int32_t
-	rc = C.mp_crl_is_revoked(crl, cert, &result)
+	rc = C.mp_crl_is_revoked(crl.c, cert, &result)
 	if rc != C.MP_OK {
 		return false, rcError("mp_crl_is_revoked", rc)
 	}
@@ -562,11 +551,11 @@ func (ctx *Context) CheckRevocation(certDER, crlDER []byte) (bool, error) {
 }
 
 // Verify does chain validation (signatures, dates, structure).
-// Revocation check is performed manually by the caller via CheckRevocation
+// Revocation check is performed manually by the caller via CRL.IsRevoked
 // per-cert, because OpenSSL's CRL_CHECK_ALL is too strict — it requires
 // a CRL for every cert in chain, but real-world certs (e.g., Sectigo leaf)
 // often have only OCSP and no CDP, which we shouldn't treat as failure.
-func (ctx *Context) Verify(leafDER []byte, roots, intermediates, crls [][]byte) (*VerifyResult, error) {
+func (ctx *Context) Verify(leafDER []byte, roots, intermediates [][]byte) (*VerifyResult, error) {
 	if len(leafDER) == 0 {
 		return nil, errors.New("empty leaf certificate")
 	}
@@ -602,14 +591,6 @@ func (ctx *Context) Verify(leafDER []byte, roots, intermediates, crls [][]byte) 
 			C.size_t(len(im)))
 		if rc != C.MP_OK {
 			return nil, fmt.Errorf("add_intermediate[%d]: %w", i, rcError("mp_store_add_intermediate", rc))
-		}
-	}
-	for i, cr := range crls {
-		rc := C.mp_store_add_crl(store,
-			(*C.uint8_t)(unsafe.Pointer(&cr[0])),
-			C.size_t(len(cr)))
-		if rc != C.MP_OK {
-			return nil, fmt.Errorf("add_crl[%d]: %w", i, rcError("mp_store_add_crl", rc))
 		}
 	}
 

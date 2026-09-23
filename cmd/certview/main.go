@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/PiDmitrius/certview/internal/limits"
 	"github.com/PiDmitrius/certview/internal/pki"
 	"github.com/PiDmitrius/certview/internal/ssrfguard"
 	"github.com/PiDmitrius/certview/internal/store"
@@ -27,7 +28,7 @@ import (
 // remote certificate. A request fails when no data arrives for idle, however
 // long a slow but progressing download takes, up to the overall timeout.
 func newGuardedHTTPClient(idle, timeout time.Duration) *http.Client {
-	dialer := &net.Dialer{Timeout: 10 * time.Second, Control: ssrfguard.DialerControl}
+	dialer := &net.Dialer{Timeout: 5 * time.Second, Control: ssrfguard.DialerControl}
 	return &http.Client{
 		Timeout: timeout,
 		Transport: idleTimeoutTransport{idle: idle, base: &http.Transport{
@@ -103,7 +104,7 @@ func main() {
 	addr := flag.String("addr", ":8080", "public listen address (read-only)")
 	adminAddr := flag.String("admin-addr", "", "admin listen address (with trust controls); empty to disable")
 	dbPath := flag.String("db", "certview.db", "SQLite database path")
-	siteCacheTTL := flag.Duration("site-cache-ttl", 60*time.Second, "site fetch cache TTL per (host,port,sni); 0 to disable")
+	cacheTTL := flag.Duration("cache-ttl", 60*time.Second, "how long site fetches, analyses and fetch failures are remembered; 0 to disable")
 	flag.Parse()
 
 	ctx, err := pki.Open()
@@ -123,19 +124,21 @@ func main() {
 	}
 
 	client := newGuardedHTTPClient(30*time.Second, 10*time.Minute)
+	go runWatchdog()
 	internalClient := &http.Client{Timeout: 60 * time.Second}
 	certgetURL := os.Getenv("CERTGET_URL")
-	var pubSC, admSC *siteCache
+	// Separate caches per listener so `IsAdmin` and any other listener-specific
+	// UI hints never cross the public/admin boundary.
+	inflight.failTTL = *cacheTTL
+	pubAC := newRespCache[analyzeResponse](*cacheTTL)
+	admAC := newRespCache[analyzeResponse](*cacheTTL)
+	var pubSC, admSC *respCache[siteResponse]
 	if certgetURL != "" {
 		log.Printf("site fetch enabled via %s", certgetURL)
-		if *siteCacheTTL > 0 {
-			// Separate caches per listener so `IsAdmin` and any other
-			// listener-specific UI hints never cross the public/admin boundary.
-			pubSC = newSiteCache(*siteCacheTTL)
-			admSC = newSiteCache(*siteCacheTTL)
-			log.Printf("site cache enabled, ttl=%s", *siteCacheTTL)
-		}
+		pubSC = newRespCache[siteResponse](*cacheTTL)
+		admSC = newRespCache[siteResponse](*cacheTTL)
 	}
+	log.Printf("cache ttl=%s", *cacheTTL)
 
 	indexBytes, err := web.Static.ReadFile("index.html")
 	if err != nil {
@@ -181,24 +184,24 @@ func main() {
 		mux.Handle("/", rootHandler)
 	}
 
-	pub := &handler{ctx: ctx, store: db, client: client, isAdmin: false, certgetURL: certgetURL, siteCache: pubSC, internalClient: internalClient}
+	pub := &handler{ctx: ctx, store: db, client: client, isAdmin: false, certgetURL: certgetURL, siteCache: pubSC, analysisCache: pubAC, internalClient: internalClient}
 	pubMux := http.NewServeMux()
 	mount(pubMux, pub)
 
 	log.Printf("public listening on %s, db: %s", *addr, *dbPath)
 	go func() {
-		log.Fatal(http.ListenAndServe(*addr, pubMux))
+		log.Fatal(limits.ListenAndServe(*addr, pubMux))
 	}()
 
 	if *adminAddr != "" {
-		adm := &handler{ctx: ctx, store: db, client: client, isAdmin: true, certgetURL: certgetURL, siteCache: admSC, internalClient: internalClient}
+		adm := &handler{ctx: ctx, store: db, client: client, isAdmin: true, certgetURL: certgetURL, siteCache: admSC, analysisCache: admAC, internalClient: internalClient}
 		admMux := http.NewServeMux()
 		mount(admMux, adm)
 		admMux.HandleFunc("POST /api/trust", adm.trust)
 		admMux.HandleFunc("POST /api/untrust", adm.untrust)
 
 		log.Printf("admin listening on %s", *adminAddr)
-		log.Fatal(http.ListenAndServe(*adminAddr, admMux))
+		log.Fatal(limits.ListenAndServe(*adminAddr, admMux))
 	} else {
 		select {}
 	}

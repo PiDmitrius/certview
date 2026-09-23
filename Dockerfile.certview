@@ -37,6 +37,7 @@ COPY --from=go-build /certview /usr/local/bin/certview
 RUN mkdir -p /data && chown -R 65532:65532 /data
 ENV LD_LIBRARY_PATH=/opt/openssl/lib
 ENV MINIPKI_GOST_ENGINE=/opt/openssl/lib/engines-3/gost.so
+ENV MALLOC_ARENA_MAX=2
 VOLUME /data
 EXPOSE 8080 8081
 USER 65532:65532

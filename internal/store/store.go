@@ -189,12 +189,14 @@ func (s *Store) FindCertByNameDER(subjectNameDER []byte) ([]byte, error) {
 	return der, err
 }
 
-func (s *Store) FindAllCertsByNameDER(subjectNameDER []byte) ([][]byte, error) {
+// FindAllCertsByNameDER returns up to limit certs with the subject, trusted first.
+func (s *Store) FindAllCertsByNameDER(subjectNameDER []byte, limit int) ([][]byte, error) {
 	if len(subjectNameDER) == 0 {
 		return nil, nil
 	}
 	rows, err := s.db.Query(
-		"SELECT der FROM certs WHERE subject_name_der = ?", subjectNameDER,
+		"SELECT der FROM certs WHERE subject_name_der = ? ORDER BY trusted DESC, id LIMIT ?",
+		subjectNameDER, limit,
 	)
 	if err != nil {
 		return nil, err
@@ -251,6 +253,19 @@ func (s *Store) FindCertByThumbprint(sha1Hex string) ([]byte, error) {
 	return der, err
 }
 
+// FreshCRLSize returns the size of the fresh CRL stored for url, 0 if none.
+func (s *Store) FreshCRLSize(url string) (int, error) {
+	var n int
+	err := s.db.QueryRow(
+		"SELECT length(der) FROM crls WHERE url = ? AND next_update > ?",
+		url, time.Now().Unix(),
+	).Scan(&n)
+	if err == sql.ErrNoRows {
+		return 0, nil
+	}
+	return n, err
+}
+
 func (s *Store) FindFreshCRL(url string) ([]byte, error) {
 	var der []byte
 	err := s.db.QueryRow(
@@ -280,7 +295,11 @@ func (s *Store) FindFreshCRLByIssuer(issuer string) ([]byte, error) {
 	return der, err
 }
 
+// SaveCRL stores the CRL and drops expired ones.
 func (s *Store) SaveCRL(issuer, url string, der []byte, thisUpdate, nextUpdate time.Time) error {
+	if _, err := s.db.Exec("DELETE FROM crls WHERE next_update < ?", time.Now().Unix()); err != nil {
+		return err
+	}
 	if url == "" {
 		// Generate stable synthetic URL for uploaded CRLs (one per issuer+next_update)
 		url = fmt.Sprintf("upload://%s|%d", issuer, nextUpdate.Unix())

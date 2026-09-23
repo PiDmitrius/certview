@@ -5,10 +5,7 @@ import (
 	"time"
 )
 
-const (
-	MaxChainLen = 16
-	MaxCertSize = 16 << 10
-)
+const MaxChainLen = 16
 
 type Fetcher interface {
 	Name() string

@@ -6,42 +6,40 @@ import (
 	"time"
 )
 
-type siteCache struct {
+type respCache[T any] struct {
 	mu      sync.Mutex
-	entries map[string]*siteCacheEntry
+	entries map[string]*respCacheEntry[T]
 	ttl     time.Duration
 }
 
-type siteCacheEntry struct {
+type respCacheEntry[T any] struct {
 	mu      sync.Mutex // singleflight gate: hold across fresh()/store() to serialize parallel callers on the same key
-	resp    *siteResponse
+	resp    *T
 	expires atomic.Int64 // unix nano; 0 = no value yet
 }
 
-func newSiteCache(ttl time.Duration) *siteCache {
-	c := &siteCache{
-		entries: make(map[string]*siteCacheEntry),
+func newRespCache[T any](ttl time.Duration) *respCache[T] {
+	c := &respCache[T]{
+		entries: make(map[string]*respCacheEntry[T]),
 		ttl:     ttl,
 	}
-	if ttl > 0 {
-		go c.cleanupLoop()
-	}
+	go c.cleanupLoop()
 	return c
 }
 
-func (c *siteCache) entryFor(key string) *siteCacheEntry {
+func (c *respCache[T]) entryFor(key string) *respCacheEntry[T] {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	e, ok := c.entries[key]
 	if !ok {
-		e = &siteCacheEntry{}
+		e = &respCacheEntry[T]{}
 		c.entries[key] = e
 	}
 	return e
 }
 
 // fresh returns the cached response if it is still valid. Caller must hold e.mu.
-func (e *siteCacheEntry) fresh() *siteResponse {
+func (e *respCacheEntry[T]) fresh() *T {
 	if e.resp == nil {
 		return nil
 	}
@@ -52,12 +50,12 @@ func (e *siteCacheEntry) fresh() *siteResponse {
 }
 
 // store sets the cached response with the given TTL. Caller must hold e.mu.
-func (e *siteCacheEntry) store(resp *siteResponse, ttl time.Duration) {
+func (e *respCacheEntry[T]) store(resp *T, ttl time.Duration) {
 	e.resp = resp
 	e.expires.Store(time.Now().Add(ttl).UnixNano())
 }
 
-func (c *siteCache) cleanupLoop() {
+func (c *respCache[T]) cleanupLoop() {
 	t := time.NewTicker(5 * time.Minute)
 	defer t.Stop()
 	for range t.C {
@@ -65,13 +63,12 @@ func (c *siteCache) cleanupLoop() {
 	}
 }
 
-func (c *siteCache) cleanup() {
+func (c *respCache[T]) cleanup() {
 	now := time.Now().UnixNano()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for k, e := range c.entries {
-		exp := e.expires.Load()
-		if exp == 0 || now <= exp {
+		if now <= e.expires.Load() {
 			continue
 		}
 		// If a fetcher holds the per-key mutex right now, leave the entry
