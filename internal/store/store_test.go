@@ -138,3 +138,76 @@ func TestLegacySerialUniqueMigrates(t *testing.T) {
 		}
 	}
 }
+
+func TestIssuerPoolExcludesUploads(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "certview.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	name := []byte("issuer name")
+	if err := s.SaveCert("CN=I", "CN=R", "01", "AB", "", name, []byte("uploaded lookalike"), true, false, ""); err != nil {
+		t.Fatal(err)
+	}
+	if der, _ := s.FindCertBySKI("AB"); der != nil {
+		t.Fatal("uploaded certificate offered as issuer by SKI")
+	}
+	if ders, _ := s.FindAllCertsByNameDER(name, 8); len(ders) != 0 {
+		t.Fatal("uploaded certificate offered as issuer by name")
+	}
+	if err := s.SaveBundledCert("CN=I", "CN=R", "02", "AB", "", name, []byte("bundled"), true, false, "ru-gov"); err != nil {
+		t.Fatal(err)
+	}
+	if der, _ := s.FindCertBySKI("AB"); string(der) != "bundled" {
+		t.Fatalf("bundled issuer by SKI: got %q", der)
+	}
+}
+
+func TestCRLStoredOncePerContent(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "certview.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	next := time.Now().Add(time.Hour)
+	crl := []byte("crl der")
+	for _, url := range []string{"http://ca.test/a.crl", "http://ca.test/a.crl?1", "http://ca.test/a.crl?2"} {
+		if err := s.SaveCRL("CN=CA", url, crl, time.Now(), next); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var n int
+	if err := s.db.QueryRow("SELECT count(*) FROM crls").Scan(&n); err != nil || n != 1 {
+		t.Fatalf("stored CRL rows: %d, %v", n, err)
+	}
+	for _, url := range []string{"http://ca.test/a.crl", "http://ca.test/a.crl?2"} {
+		if der, _ := s.FindFreshCRL(url); !bytes.Equal(der, crl) {
+			t.Fatalf("%s: got %q", url, der)
+		}
+	}
+}
+
+func TestRepairSHA1Once(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "certview.db")
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der := []byte("root der")
+	if err := s.SaveCert("CN=R", "CN=R", "00", "", "", nil, der, true, true, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec("UPDATE certs SET thumbprint_sha1 = 'WRONG'; PRAGMA user_version = 0"); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+
+	s, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if got, _ := s.FindCertByThumbprint(sha1hex(der)); !bytes.Equal(got, der) {
+		t.Fatal("thumbprint not repaired")
+	}
+}

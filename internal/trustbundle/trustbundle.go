@@ -47,7 +47,7 @@ func importBundle(ctx *pki.Context, st *store.Store, data []byte, source string)
 				trustedCount++
 			}
 		} else {
-			if err := st.SaveCert(
+			if err := st.SaveBundledCert(
 				info.Subject, info.Issuer, info.Serial,
 				info.SKI, info.AKI, info.SubjectNameDER,
 				info.DER, info.IsCA, info.IsSelfSigned, source,

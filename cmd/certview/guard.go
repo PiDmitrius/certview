@@ -76,6 +76,17 @@ var (
 	errUnreachable = errors.New("unreachable")
 )
 
+// unreachableError is a failure to connect to addr (host:port as dialed,
+// which after a redirect is not the requested URL's endpoint).
+type unreachableError struct {
+	addr string
+	err  error
+}
+
+func (e *unreachableError) Error() string        { return "unreachable " + e.addr + ": " + e.err.Error() }
+func (e *unreachableError) Unwrap() error        { return e.err }
+func (e *unreachableError) Is(target error) bool { return target == errUnreachable }
+
 type budgetKey struct{}
 
 type slotKey struct{}
@@ -269,8 +280,8 @@ type fetchCall struct {
 	err         error
 }
 
-// do fetches under key; a failure wrapping errUnreachable also marks the
-// endpoint (scheme://host:port).
+// do fetches under key; a failure to connect to the endpoint itself
+// (scheme://host:port) also marks the endpoint.
 func (f *fetchFlight) do(ctx context.Context, kind fetchKind, key, endpoint string, fetch func(context.Context) ([]byte, string, error)) ([]byte, string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, "", err
@@ -316,7 +327,8 @@ func (f *fetchFlight) do(ctx context.Context, kind fetchKind, key, endpoint stri
 					}
 				}
 				f.failed[key] = failure{c.err, now.Add(f.failTTL)}
-				if errors.Is(c.err, errUnreachable) {
+				var ue *unreachableError
+				if errors.As(c.err, &ue) && strings.EqualFold(strings.SplitN(endpoint, "://", 2)[1], ue.addr) {
 					f.failed[hostKey] = failure{c.err, now.Add(f.failTTL)}
 				}
 			}

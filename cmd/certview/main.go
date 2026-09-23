@@ -32,17 +32,20 @@ func newGuardedHTTPClient(idle, timeout time.Duration) *http.Client {
 	return &http.Client{
 		Timeout: timeout,
 		Transport: idleTimeoutTransport{idle: idle, base: &http.Transport{
+			MaxIdleConns:        64,
+			MaxIdleConnsPerHost: 2,
+			IdleConnTimeout:     idle,
 			DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
 				host, _, err := net.SplitHostPort(address)
 				if err != nil {
 					return nil, err
 				}
 				if err := ssrfguard.Check(ctx, host); err != nil {
-					return nil, fmt.Errorf("%w: ssrfguard: %w", errUnreachable, err)
+					return nil, &unreachableError{address, fmt.Errorf("ssrfguard: %w", err)}
 				}
 				conn, err := dialer.DialContext(ctx, network, address)
 				if err != nil {
-					return nil, fmt.Errorf("%w: %w", errUnreachable, err)
+					return nil, &unreachableError{address, err}
 				}
 				return conn, nil
 			},

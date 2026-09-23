@@ -70,6 +70,7 @@ func (h *handler) config(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) analyzeSite(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 8<<10)
 	var req siteRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "bad request: "+err.Error(), http.StatusBadRequest)
@@ -176,24 +177,17 @@ func (h *handler) doAnalyzeSite(ctx context.Context, host string, port int, sni 
 			continue
 		}
 
-		// Pre-cache intermediates so doAnalyze's resolveIssuer finds them in store.
-		sourceURL := fmt.Sprintf("tls://%s:%d?via=%s", host, port, r.Client)
+		var bag []bagCert
 		for _, der := range ders[1:] {
 			info, err := h.ctx.ParseCertInfo(der)
 			if err != nil {
 				rl.f("site: %s skip intermediate (parse): %v", r.Client, err)
 				continue
 			}
-			if err := h.store.SaveCert(
-				info.Subject, info.Issuer, info.Serial,
-				info.SKI, info.AKI, info.SubjectNameDER,
-				info.DER, info.IsCA, info.IsSelfSigned, sourceURL,
-			); err != nil {
-				rl.f("site: %s store.SaveCert intermediate: %v", r.Client, err)
-			}
+			bag = append(bag, bagCert{info, "tls"})
 		}
 
-		analysis, err := h.analyzeData(ctx, rl, ders[0])
+		analysis, err := h.analyzeData(ctx, rl, ders[0], bag)
 		if err != nil {
 			return nil, err
 		}

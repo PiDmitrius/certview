@@ -55,6 +55,13 @@ func (c *respCache[T]) get(ctx context.Context, key string, compute func() (*T, 
 	return resp, false, nil
 }
 
+// purge forgets every cached response.
+func (c *respCache[T]) purge() {
+	c.mu.Lock()
+	c.entries = make(map[string]*respCacheEntry[T])
+	c.mu.Unlock()
+}
+
 func (c *respCache[T]) cleanupLoop() {
 	t := time.NewTicker(max(c.ttl, 5*time.Second))
 	defer t.Stop()

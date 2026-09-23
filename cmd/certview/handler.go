@@ -88,6 +88,7 @@ type certJSON struct {
 	ThumbprintSHA1     string     `json:"thumbprint_sha1"`
 	ThumbprintSHA256   string     `json:"thumbprint_sha256"`
 	derJSON
+	Stored bool   `json:"stored"`
 	Source string `json:"source,omitempty"`
 }
 
@@ -211,6 +212,7 @@ func (h *handler) certToJSON(c *pki.CertInfo, source string) certJSON {
 		ThumbprintSHA1:     strings.ToUpper(hex.EncodeToString(s1[:])),
 		ThumbprintSHA256:   strings.ToUpper(hex.EncodeToString(s256[:])),
 		derJSON:            h.derRef(c.DER),
+		Stored:             h.store.HasDER(store.SHA256Hex(c.DER)),
 		Source:             source,
 	}
 }
@@ -306,11 +308,13 @@ func (h *handler) doAnalyze(ctx context.Context, data []byte) (*analyzeResponse,
 		return nil, err
 	}
 	defer release()
-	return h.analyzeData(ctx, rl, data)
+	return h.analyzeData(ctx, rl, data, nil)
 }
 
-// analyzeData runs one analysis within a context from guardAnalysis.
-func (h *handler) analyzeData(ctx context.Context, rl reqLog, data []byte) (*analyzeResponse, error) {
+// analyzeData runs one analysis within a context from guardAnalysis. bag
+// holds certificates this analysis may use as issuers beyond the trusted
+// pool, such as the chain a site presented.
+func (h *handler) analyzeData(ctx context.Context, rl reqLog, data []byte, bag []bagCert) (*analyzeResponse, error) {
 	start := time.Now()
 	resp := &analyzeResponse{}
 
@@ -354,7 +358,7 @@ func (h *handler) analyzeData(ctx context.Context, rl reqLog, data []byte) (*ana
 	}
 
 	chain := []chainEntry{{info: leaf, source: "upload"}}
-	var aiaBag []bagCert
+	aiaBag := bag
 	seen := map[string]bool{store.SHA256Hex(leaf.DER): true}
 
 	current := leaf
@@ -395,6 +399,58 @@ func (h *handler) analyzeData(ctx context.Context, rl reqLog, data []byte) (*ana
 		}
 	}
 
+	var roots, intermediates [][]byte
+	seenDER := map[string]bool{}
+	addCert := func(target *[][]byte, der []byte) {
+		key := string(der)
+		if seenDER[key] {
+			return
+		}
+		seenDER[key] = true
+		*target = append(*target, der)
+	}
+
+	// If leaf itself is a self-signed root, treat it as trust anchor
+	if leaf.IsSelfSigned {
+		addCert(&roots, leaf.DER)
+	}
+
+	for _, entry := range chain[1:] {
+		if entry.info.IsSelfSigned {
+			addCert(&roots, entry.info.DER)
+		} else {
+			addCert(&intermediates, entry.info.DER)
+		}
+	}
+
+	for _, c := range aiaBag {
+		if c.info.IsSelfSigned {
+			addCert(&roots, c.info.DER)
+		} else {
+			addCert(&intermediates, c.info.DER)
+		}
+	}
+
+	// Add ALL alternate cert candidates from store with same subject as any chain entry's issuer.
+	// Same CA can have multiple certs (cross-signed, re-issued with same key) — let OpenSSL pick.
+	for _, entry := range chain {
+		if len(entry.info.IssuerNameDER) == 0 {
+			continue
+		}
+		ders, _ := h.store.FindAllCertsByNameDER(entry.info.IssuerNameDER, maxAltCandidates)
+		for _, der := range ders {
+			info, err := h.ctx.ParseCertInfo(der)
+			if err != nil {
+				continue
+			}
+			if info.IsSelfSigned {
+				addCert(&roots, der)
+			} else {
+				addCert(&intermediates, der)
+			}
+		}
+	}
+
 	type revResult struct {
 		status  string
 		revoked bool
@@ -403,13 +459,6 @@ func (h *handler) analyzeData(ctx context.Context, rl reqLog, data []byte) (*ana
 	certRevocations := make([]revResult, len(chain))
 	issuerCRLs := make(map[int][]crlJSON)
 	issuerOCSPs := make(map[int][]ocspJSON)
-	type pendingCRL struct {
-		info   *pki.CRLInfo
-		url    string
-		der    []byte
-		issuer *pki.CertInfo
-	}
-	var verifiedCRLs []pendingCRL
 
 	for i, entry := range chain {
 		if err := ctx.Err(); err != nil {
@@ -457,7 +506,7 @@ func (h *handler) analyzeData(ctx context.Context, rl reqLog, data []byte) (*ana
 			return nil
 		}
 
-		processCRL := func(crl *pki.CRL, crlDER []byte, source string, url string) {
+		processCRL := func(crl *pki.CRL, source string, url string) {
 			crlInfo := crl.Info
 			sigStatus, sigMsg := "unchecked", ""
 			var sigWarn string
@@ -522,9 +571,15 @@ func (h *handler) analyzeData(ctx context.Context, rl reqLog, data []byte) (*ana
 				crlChecked = true
 			}
 
-			// Fetched CRLs are persisted once their issuer is known to chain to a trusted anchor.
+			// Fetched CRLs are persisted when their issuer verifies to a trusted root.
 			if authoritative && source == "fetched" {
-				verifiedCRLs = append(verifiedCRLs, pendingCRL{crlInfo, url, crlDER, crlIssuer})
+				if _, ok := h.trustedPath(crlIssuer.DER, roots, intermediates); !ok {
+					rl.f("crl[%d]: not saved, issuer has no trusted anchor: %s", i, url)
+				} else if err := h.store.SaveCRL(crlInfo.Issuer, url, crl.DER, crlInfo.ThisUpdate, crlInfo.NextUpdate); err != nil {
+					rl.f("crl[%d]: store.SaveCRL: %v", i, err)
+				} else {
+					rl.f("crl[%d]: saved to store: %s", i, url)
+				}
 			}
 
 			thisFmt := crlInfo.ThisUpdate.Format(time.RFC3339)
@@ -557,7 +612,7 @@ func (h *handler) analyzeData(ctx context.Context, rl reqLog, data []byte) (*ana
 					CertRevoked:  revoked, Source: source,
 					SignatureStatus: sigStatus, SignatureMsg: sigMsg,
 					HasIDP:  crlInfo.HasIDP,
-					derJSON: h.derRef(crlDER),
+					derJSON: h.derRef(crl.DER),
 				})
 			}
 		}
@@ -569,8 +624,8 @@ func (h *handler) analyzeData(ctx context.Context, rl reqLog, data []byte) (*ana
 			if crlChecked || ctx.Err() != nil {
 				break
 			}
-			if crl, der, closeCRL := h.cachedCRL(ctx, rl, url); crl != nil {
-				processCRL(crl, der, "cache", url)
+			if crl, closeCRL := h.cachedCRL(ctx, rl, url); crl != nil {
+				processCRL(crl, "cache", url)
 				closeCRL()
 			}
 		}
@@ -578,13 +633,13 @@ func (h *handler) analyzeData(ctx context.Context, rl reqLog, data []byte) (*ana
 			if crlChecked || ctx.Err() != nil {
 				break
 			}
-			crl, der, closeCRL, err := h.fetchCRL(ctx, rl, url)
+			crl, closeCRL, err := h.fetchCRL(ctx, rl, url)
 			if err != nil {
 				rl.f("crl[%d]: FAILED url=%s err=%v", i, url, err)
 				fetchErrors = append(fetchErrors, fmt.Sprintf("%s: %v", url, err))
 				continue
 			}
-			processCRL(crl, der, "fetched", url)
+			processCRL(crl, "fetched", url)
 			closeCRL()
 		}
 		if err := ctx.Err(); err != nil {
@@ -600,7 +655,7 @@ func (h *handler) analyzeData(ctx context.Context, rl reqLog, data []byte) (*ana
 				crl, closeCRL, err := h.openCRL(ctx, der)
 				if err == nil {
 					rl.f("crl[%d]: found CRL in store by issuer", i)
-					processCRL(crl, der, "store", "")
+					processCRL(crl, "store", "")
 					closeCRL()
 					fetchErrors = nil
 				}
@@ -656,50 +711,6 @@ func (h *handler) analyzeData(ctx context.Context, rl reqLog, data []byte) (*ana
 		if !crlChecked && len(fetchErrors) > 0 && issuerIdx >= 0 {
 			issuerCRLs[issuerIdx] = append(issuerCRLs[issuerIdx],
 				crlJSON{URLs: entry.info.CDPURLs, Errors: fetchErrors})
-		}
-	}
-
-	var roots, intermediates [][]byte
-	seenDER := map[string]bool{}
-	addCert := func(target *[][]byte, der []byte) {
-		key := string(der)
-		if seenDER[key] {
-			return
-		}
-		seenDER[key] = true
-		*target = append(*target, der)
-	}
-
-	// If leaf itself is a self-signed root, treat it as trust anchor
-	if leaf.IsSelfSigned {
-		addCert(&roots, leaf.DER)
-	}
-
-	for _, entry := range chain[1:] {
-		if entry.info.IsSelfSigned {
-			addCert(&roots, entry.info.DER)
-		} else {
-			addCert(&intermediates, entry.info.DER)
-		}
-	}
-
-	// Add ALL alternate cert candidates from store with same subject as any chain entry's issuer.
-	// Same CA can have multiple certs (cross-signed, re-issued with same key) — let OpenSSL pick.
-	for _, entry := range chain {
-		if len(entry.info.IssuerNameDER) == 0 {
-			continue
-		}
-		ders, _ := h.store.FindAllCertsByNameDER(entry.info.IssuerNameDER, maxAltCandidates)
-		for _, der := range ders {
-			info, err := h.ctx.ParseCertInfo(der)
-			if err != nil {
-				continue
-			}
-			if info.IsSelfSigned {
-				addCert(&roots, der)
-			} else {
-				addCert(&intermediates, der)
-			}
 		}
 	}
 
@@ -780,18 +791,6 @@ func (h *handler) analyzeData(ctx context.Context, rl reqLog, data []byte) (*ana
 		}
 	}
 
-	for _, c := range verifiedCRLs {
-		if !h.chainsToTrust(c.issuer) {
-			rl.f("crl: not saved, issuer has no trusted anchor: %s", c.url)
-			continue
-		}
-		if err := h.store.SaveCRL(c.info.Issuer, c.url, c.der, c.info.ThisUpdate, c.info.NextUpdate); err != nil {
-			rl.f("crl: store.SaveCRL: %v", err)
-		} else {
-			rl.f("crl: saved to store: %s", c.url)
-		}
-	}
-
 	for i, entry := range chain {
 		cj := h.certToJSON(entry.info, entry.source)
 		if certRevocations[i].status != "" {
@@ -828,7 +827,7 @@ func (h *handler) doAnalyzeCRL(rl reqLog, start time.Time, data []byte, crl *pki
 		RevokedCount: crlInfo.RevokedCount,
 		HasIDP:       crlInfo.HasIDP,
 		Source:       "upload",
-		derJSON:      h.derRef(data),
+		derJSON:      h.derRef(crl.DER),
 	}
 
 	// Freshness check
@@ -893,12 +892,12 @@ func (h *handler) doAnalyzeCRL(rl reqLog, start time.Time, data []byte, crl *pki
 
 		if !h.chainsToTrust(caInfo) {
 			rl.f("uploaded CRL not saved: issuer chain has no trusted anchor")
-		} else if err := h.store.SaveCRL(crlInfo.Issuer, "", data, crlInfo.ThisUpdate, crlInfo.NextUpdate); err != nil {
+		} else if err := h.store.SaveCRL(crlInfo.Issuer, "", crl.DER, crlInfo.ThisUpdate, crlInfo.NextUpdate); err != nil {
 			rl.f("store.SaveCRL(uploaded): %v", err)
 		} else {
 			rl.f("uploaded CRL saved to store: issuer=%q next=%s", crlInfo.Issuer, nextFmt)
 		}
-		crlJ.derJSON = h.derRef(data)
+		crlJ.derJSON = h.derRef(crl.DER)
 
 		cj := h.certToJSON(caInfo, "cache")
 		cj.Trusted = h.trusted(caInfo)
@@ -990,19 +989,11 @@ func (h *handler) trusted(c *pki.CertInfo) bool {
 	return t
 }
 
-// bagCert is a certificate from an AIA response, a candidate issuer for the
-// rest of the analysis; only certificates chosen as issuers are stored.
+// bagCert is a candidate issuer for one analysis only — from the site's TLS
+// chain or the analysis's own AIA responses. Bags are never stored.
 type bagCert struct {
-	info *pki.CertInfo
-	url  string
-}
-
-func (h *handler) saveIssuer(rl reqLog, c bagCert) {
-	i := c.info
-	if err := h.store.SaveCert(i.Subject, i.Issuer, i.Serial, i.SKI, i.AKI, i.SubjectNameDER,
-		i.DER, i.IsCA, i.IsSelfSigned, c.url); err != nil {
-		rl.f("  store.SaveCert: %v", err)
-	}
+	info   *pki.CertInfo
+	source string // "tls" | "fetched"
 }
 
 func (h *handler) resolveIssuer(ctx context.Context, rl reqLog, cert *pki.CertInfo, resp *analyzeResponse, bag *[]bagCert) (*pki.CertInfo, string) {
@@ -1021,7 +1012,16 @@ func (h *handler) resolveIssuer(ctx context.Context, rl reqLog, cert *pki.CertIn
 		return info
 	}
 
-	// 1. AKI → SKI
+	// 1. Certificates this analysis already holds
+	for _, c := range *bag {
+		if (cert.AKI != "" && c.info.SKI == cert.AKI) ||
+			(cert.AKI == "" && bytes.Equal(c.info.SubjectNameDER, cert.IssuerNameDER)) {
+			rl.f("  bag: matched %q", c.info.Subject)
+			return c.info, c.source
+		}
+	}
+
+	// 2. Trusted pool: AKI → SKI
 	if cert.AKI != "" {
 		if der, err := h.store.FindCertBySKI(cert.AKI); err == nil && der != nil {
 			rl.f("  cache: SKI=%s → HIT", cert.AKI)
@@ -1033,7 +1033,7 @@ func (h *handler) resolveIssuer(ctx context.Context, rl reqLog, cert *pki.CertIn
 		}
 	}
 
-	// 2. DER name
+	// 3. Trusted pool: DER name
 	if len(cert.IssuerNameDER) > 0 {
 		if der, err := h.store.FindCertByNameDER(cert.IssuerNameDER); err == nil && der != nil {
 			rl.f("  cache: NameDER → HIT")
@@ -1045,7 +1045,7 @@ func (h *handler) resolveIssuer(ctx context.Context, rl reqLog, cert *pki.CertIn
 		}
 	}
 
-	// 3. String subject fallback
+	// 4. Trusted pool: string subject
 	if der, err := h.store.FindCertBySubject(cert.Issuer); err == nil && der != nil {
 		rl.f("  cache: subject=%q → HIT", cert.Issuer)
 		if info := tryCandidate(der, "subject"); info != nil {
@@ -1053,16 +1053,6 @@ func (h *handler) resolveIssuer(ctx context.Context, rl reqLog, cert *pki.CertIn
 		}
 	} else {
 		rl.f("  cache: subject=%q → miss", cert.Issuer)
-	}
-
-	// 4. Certificates from AIA responses earlier in this analysis
-	for _, c := range *bag {
-		if (cert.AKI != "" && c.info.SKI == cert.AKI) ||
-			(cert.AKI == "" && bytes.Equal(c.info.SubjectNameDER, cert.IssuerNameDER)) {
-			rl.f("  AIA bag: matched %q", c.info.Subject)
-			h.saveIssuer(rl, c)
-			return c.info, "fetched"
-		}
 	}
 
 	// 5. Fetch via AIA
@@ -1107,7 +1097,7 @@ func (h *handler) resolveIssuer(ctx context.Context, rl reqLog, cert *pki.CertIn
 				continue
 			}
 			allParsed = append(allParsed, info)
-			*bag = append(*bag, bagCert{info, url})
+			*bag = append(*bag, bagCert{info, "fetched"})
 		}
 
 		// Selection priority: self-signed SKI match > any SKI match > any cert
@@ -1136,7 +1126,6 @@ func (h *handler) resolveIssuer(ctx context.Context, rl reqLog, cert *pki.CertIn
 				rl.f("  AIA: WARNING — no SKI match, using first cert (AKI=%s, got SKI=%s)",
 					cert.AKI, match.SKI)
 			}
-			h.saveIssuer(rl, bagCert{match, url})
 			return match, "fetched"
 		}
 	}
@@ -1159,46 +1148,46 @@ func (h *handler) openCRL(ctx context.Context, der []byte) (*pki.CRL, func(), er
 	return crl, func() { crl.Close(); release() }, nil
 }
 
-func (h *handler) cachedCRL(ctx context.Context, rl reqLog, url string) (*pki.CRL, []byte, func()) {
+func (h *handler) cachedCRL(ctx context.Context, rl reqLog, url string) (*pki.CRL, func()) {
 	size, err := h.store.FreshCRLSize(url)
 	if err != nil || size == 0 {
 		rl.f("  crl cache: %s → miss", url)
-		return nil, nil, nil
+		return nil, nil
 	}
 	release, err := acquireCRLMemory(ctx, size)
 	if err != nil {
-		return nil, nil, nil
+		return nil, nil
 	}
 	der, err := h.store.FindFreshCRL(url)
 	if err != nil || der == nil {
 		release()
 		rl.f("  crl cache: %s → miss", url)
-		return nil, nil, nil
+		return nil, nil
 	}
 	rl.f("  crl cache: %s → HIT", url)
 	crl, err := h.ctx.ParseCRL(der)
 	if err != nil {
 		release()
 		rl.f("  crl cache: hit but parse failed: %v", err)
-		return nil, nil, nil
+		return nil, nil
 	}
-	return crl, der, func() { crl.Close(); release() }
+	return crl, func() { crl.Close(); release() }
 }
 
 // fetchCRL does not persist: processCRL saves only after signature verification.
-func (h *handler) fetchCRL(ctx context.Context, rl reqLog, url string) (*pki.CRL, []byte, func(), error) {
+func (h *handler) fetchCRL(ctx context.Context, rl reqLog, url string) (*pki.CRL, func(), error) {
 	rl.f("  crl fetch: %s", url)
 	der, contentType, err := h.fetchWithInfo(ctx, fetchCRL, url)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 	rl.f("  crl fetch: %d bytes, content-type=%s", len(der), contentType)
 
 	crl, closeCRL, err := h.openCRL(ctx, der)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("parse CRL: %w", err)
+		return nil, nil, fmt.Errorf("parse CRL: %w", err)
 	}
-	return crl, der, closeCRL, nil
+	return crl, closeCRL, nil
 }
 
 func (h *handler) derBySHA256(w http.ResponseWriter, r *http.Request) {
@@ -1257,16 +1246,34 @@ func (h *handler) untrust(w http.ResponseWriter, r *http.Request) {
 func (h *handler) toggleTrust(w http.ResponseWriter, r *http.Request, trusted bool) {
 	var req struct {
 		SHA256 string `json:"sha256"`
+		DER    []byte `json:"der_b64"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.SHA256 == "" {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 2*limits.CertSize)).Decode(&req); err != nil || req.SHA256 == "" {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
+	}
+	// A certificate seen only in an analysis is stored when it is trusted.
+	if trusted && len(req.DER) > 0 {
+		info, err := h.ctx.ParseCertInfo(req.DER)
+		if err != nil || !strings.EqualFold(store.SHA256Hex(info.DER), req.SHA256) {
+			http.Error(w, "certificate does not match sha256", http.StatusBadRequest)
+			return
+		}
+		if err := h.store.SaveCert(info.Subject, info.Issuer, info.Serial, info.SKI, info.AKI,
+			info.SubjectNameDER, info.DER, info.IsCA, info.IsSelfSigned, "admin"); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
 	}
 	if err := h.store.SetTrusted(req.SHA256, trusted); err != nil {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
 	}
 	log.Printf("[admin] cert sha256=%s → trusted=%v", req.SHA256, trusted)
+	h.analysisCache.purge()
+	if h.siteCache != nil {
+		h.siteCache.purge()
+	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]bool{"ok": true, "trusted": trusted})
 }

@@ -432,10 +432,12 @@ func (ctx *Context) ParseAllCerts(data []byte) ([][]byte, error) {
 }
 
 // CRL is a parsed CRL. Parse once per request and Close when done: large
-// CRLs cost seconds of CPU per parse.
+// CRLs cost seconds of CPU per parse. DER is its canonical encoding, the
+// form to store and hash whatever form was parsed.
 type CRL struct {
 	c    C.MP_CRL
 	Info *CRLInfo
+	DER  []byte
 }
 
 func (ctx *Context) ParseCRL(data []byte) (*CRL, error) {
@@ -489,7 +491,14 @@ func (ctx *Context) ParseCRL(data []byte) (*CRL, error) {
 		info.HasIDP = hasIDP == 1
 	}
 
-	return &CRL{c: crl, Info: info}, nil
+	var der *C.uint8_t
+	var derlen C.size_t
+	if rc := C.mp_crl_der(crl, &der, &derlen); rc != C.MP_OK {
+		C.mp_crl_close(crl)
+		return nil, rcError("mp_crl_der", rc)
+	}
+
+	return &CRL{c: crl, Info: info, DER: C.GoBytes(unsafe.Pointer(der), C.int(derlen))}, nil
 }
 
 // Close frees the CRL and returns the freed heap to the OS: a parsed large

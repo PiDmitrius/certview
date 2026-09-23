@@ -71,11 +71,11 @@ func TestFetchFlightRemembersFailureForTTL(t *testing.T) {
 	var calls atomic.Int32
 	fail := func(context.Context) ([]byte, string, error) {
 		calls.Add(1)
-		return nil, "", errUnreachable
+		return nil, "", &unreachableError{"example.test:80", errors.New("refused")}
 	}
 	try := func(urls ...string) {
 		for _, url := range urls {
-			if _, _, err := f.do(context.Background(), fetchAIA, url, "example.test", fail); err == nil {
+			if _, _, err := f.do(context.Background(), fetchAIA, url, "http://example.test:80", fail); err == nil {
 				t.Fatal("expected error")
 			}
 		}
@@ -304,4 +304,19 @@ func TestCRLGateNotHeldWhileWaitingForSlot(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	<-bigCRL
 	(<-done)()
+}
+
+func TestRedirectFailureKeepsEndpoint(t *testing.T) {
+	f := &fetchFlight{calls: map[string]*fetchCall{}, failed: map[string]failure{}, failTTL: time.Minute}
+	var calls atomic.Int32
+	fail := func(context.Context) ([]byte, string, error) {
+		calls.Add(1)
+		return nil, "", &unreachableError{"mirror.test:80", errors.New("refused")}
+	}
+	for _, url := range []string{"http://ca.test/a.crt", "http://ca.test/b.crt"} {
+		f.do(context.Background(), fetchAIA, url, "http://ca.test:80", fail)
+	}
+	if n := calls.Load(); n != 2 {
+		t.Fatalf("attempts: got %d, want 2 (a redirect target's failure must not mark the CA endpoint)", n)
+	}
 }

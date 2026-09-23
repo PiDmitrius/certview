@@ -27,7 +27,11 @@ func SHA256Hex(der []byte) string {
 var derTables = []string{"certs", "crls", "ocsp_responses"}
 
 // A certificate is identified by the SHA-256 of its DER: serials are unique
-// only per issuer, so trust and deduplication never go by serial.
+// only per issuer, so trust and deduplication never go by serial. Any
+// certificate may be stored, but only trusted or bundled ones are candidate
+// issuers for analyses (poolCond): whatever else is stored came from untrusted
+// uploads, sites or AIA responses and must not steer other analyses. CRLs are
+// stored once per content, with fetch URLs mapped to it in crl_urls.
 const certsDDL = `CREATE TABLE IF NOT EXISTS %s (
 	id               INTEGER PRIMARY KEY,
 	subject          TEXT    NOT NULL,
@@ -37,6 +41,7 @@ const certsDDL = `CREATE TABLE IF NOT EXISTS %s (
 	aki              TEXT    NOT NULL DEFAULT '',
 	subject_name_der BLOB,
 	trusted          INTEGER NOT NULL DEFAULT 0,
+	bundled          INTEGER NOT NULL DEFAULT 0,
 	thumbprint_sha1  TEXT    NOT NULL DEFAULT '',
 	sha256           TEXT    NOT NULL DEFAULT '',
 	der              BLOB    NOT NULL,
@@ -46,7 +51,21 @@ const certsDDL = `CREATE TABLE IF NOT EXISTS %s (
 	created_at       INTEGER NOT NULL
 )`
 
-const certsColumns = "id, subject, issuer, serial, ski, aki, subject_name_der, trusted, thumbprint_sha1, sha256, der, is_ca, is_self_signed, source_url, created_at"
+const certsColumns = "id, subject, issuer, serial, ski, aki, subject_name_der, trusted, bundled, thumbprint_sha1, sha256, der, is_ca, is_self_signed, source_url, created_at"
+
+const poolCond = "(trusted = 1 OR bundled = 1)"
+
+const crlsDDL = `CREATE TABLE IF NOT EXISTS %s (
+	id          INTEGER PRIMARY KEY,
+	issuer      TEXT    NOT NULL,
+	sha256      TEXT    NOT NULL DEFAULT '',
+	der         BLOB    NOT NULL,
+	this_update INTEGER NOT NULL,
+	next_update INTEGER NOT NULL,
+	created_at  INTEGER NOT NULL
+)`
+
+const crlsColumns = "id, issuer, sha256, der, this_update, next_update, created_at"
 
 var serialUnique = regexp.MustCompile(`serial\s+TEXT\s+NOT NULL\s+UNIQUE`)
 
@@ -71,17 +90,14 @@ func (s *Store) migrate() error {
 	if _, err := s.db.Exec(fmt.Sprintf(certsDDL, "certs")); err != nil {
 		return err
 	}
+	if _, err := s.db.Exec(fmt.Sprintf(crlsDDL, "crls")); err != nil {
+		return err
+	}
 	_, err := s.db.Exec(`
-		CREATE TABLE IF NOT EXISTS crls (
-			id          INTEGER PRIMARY KEY,
-			issuer      TEXT    NOT NULL,
-			url         TEXT    NOT NULL UNIQUE,
-			der         BLOB   NOT NULL,
-			this_update INTEGER NOT NULL,
-			next_update INTEGER NOT NULL,
-			created_at  INTEGER NOT NULL
+		CREATE TABLE IF NOT EXISTS crl_urls (
+			url    TEXT PRIMARY KEY,
+			sha256 TEXT NOT NULL
 		);
-		CREATE INDEX IF NOT EXISTS idx_crls_url ON crls(url);
 
 		CREATE TABLE IF NOT EXISTS ocsp_responses (
 			id              INTEGER PRIMARY KEY,
@@ -105,6 +121,7 @@ func (s *Store) migrate() error {
 	s.db.Exec("ALTER TABLE certs ADD COLUMN subject_name_der BLOB")
 	s.db.Exec("ALTER TABLE certs ADD COLUMN trusted INTEGER NOT NULL DEFAULT 0")
 	s.db.Exec("ALTER TABLE certs ADD COLUMN thumbprint_sha1 TEXT NOT NULL DEFAULT ''")
+	s.db.Exec("ALTER TABLE certs ADD COLUMN bundled INTEGER NOT NULL DEFAULT 0")
 	for _, t := range derTables {
 		s.db.Exec("ALTER TABLE " + t + " ADD COLUMN sha256 TEXT NOT NULL DEFAULT ''")
 		if err := s.backfillSHA256(t); err != nil {
@@ -114,10 +131,17 @@ func (s *Store) migrate() error {
 	if err := s.dropSerialUnique(); err != nil {
 		return fmt.Errorf("certs: drop serial uniqueness: %w", err)
 	}
+	if err := s.splitCRLURLs(); err != nil {
+		return fmt.Errorf("crls: split urls: %w", err)
+	}
+	if err := s.repairSHA1(); err != nil {
+		return fmt.Errorf("certs: repair sha1: %w", err)
+	}
 
 	for _, stmt := range []string{
 		"CREATE UNIQUE INDEX IF NOT EXISTS idx_certs_sha256 ON certs(sha256)",
-		"CREATE INDEX IF NOT EXISTS idx_crls_sha256 ON crls(sha256)",
+		"CREATE UNIQUE INDEX IF NOT EXISTS idx_crls_sha256 ON crls(sha256)",
+		"CREATE INDEX IF NOT EXISTS idx_crls_issuer ON crls(issuer)",
 		"CREATE INDEX IF NOT EXISTS idx_ocsp_responses_sha256 ON ocsp_responses(sha256)",
 		"CREATE INDEX IF NOT EXISTS idx_certs_subject ON certs(subject)",
 		"CREATE INDEX IF NOT EXISTS idx_certs_serial ON certs(serial)",
@@ -160,22 +184,86 @@ func (s *Store) dropSerialUnique() error {
 	return tx.Commit()
 }
 
-func (s *Store) backfillSHA256(table string) error {
-	rows, err := s.db.Query("SELECT id FROM " + table + " WHERE sha256 = ''")
+// repairSHA1 recomputes thumbprints once (user_version 1): serial-keyed
+// imports once wrote another certificate's thumbprint on a shared serial.
+func (s *Store) repairSHA1() error {
+	var v int
+	if err := s.db.QueryRow("PRAGMA user_version").Scan(&v); err != nil || v >= 1 {
+		return err
+	}
+	ids, err := s.ids("SELECT id FROM certs")
 	if err != nil {
 		return err
 	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, id := range ids {
+		var der []byte
+		if err := tx.QueryRow("SELECT der FROM certs WHERE id = ?", id).Scan(&der); err != nil {
+			return err
+		}
+		if _, err := tx.Exec("UPDATE certs SET thumbprint_sha1 = ? WHERE id = ?", sha1hex(der), id); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec("PRAGMA user_version = 1"); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// splitCRLURLs rebuilds a crls table keyed by URL into content rows plus
+// crl_urls, keeping the newest row per content.
+func (s *Store) splitCRLURLs() error {
+	var n int
+	if err := s.db.QueryRow("SELECT count(*) FROM pragma_table_info('crls') WHERE name = 'url'").Scan(&n); err != nil {
+		return err
+	}
+	if n == 0 {
+		return nil
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, stmt := range []string{
+		"INSERT OR REPLACE INTO crl_urls (url, sha256) SELECT url, sha256 FROM crls WHERE url NOT LIKE 'upload://%' ORDER BY id",
+		fmt.Sprintf(crlsDDL, "crls_new"),
+		"INSERT INTO crls_new (" + crlsColumns + ") SELECT " + crlsColumns + " FROM crls WHERE id IN (SELECT max(id) FROM crls GROUP BY sha256)",
+		"DROP TABLE crls",
+		"ALTER TABLE crls_new RENAME TO crls",
+	} {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *Store) ids(query string) ([]int64, error) {
+	rows, err := s.db.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
 	var ids []int64
 	for rows.Next() {
 		var id int64
 		if err := rows.Scan(&id); err != nil {
-			rows.Close()
-			return err
+			return nil, err
 		}
 		ids = append(ids, id)
 	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
+	return ids, rows.Err()
+}
+
+func (s *Store) backfillSHA256(table string) error {
+	ids, err := s.ids("SELECT id FROM " + table + " WHERE sha256 = ''")
+	if err != nil {
 		return err
 	}
 	for _, id := range ids {
@@ -243,7 +331,7 @@ func (s *Store) FindCertBySKI(ski string) ([]byte, error) {
 	}
 	var der []byte
 	err := s.db.QueryRow(
-		"SELECT der FROM certs WHERE ski = ? ORDER BY is_self_signed DESC LIMIT 1", ski,
+		"SELECT der FROM certs WHERE ski = ? AND "+poolCond+" ORDER BY is_self_signed DESC LIMIT 1", ski,
 	).Scan(&der)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -257,7 +345,7 @@ func (s *Store) FindCertByNameDER(subjectNameDER []byte) ([]byte, error) {
 	}
 	var der []byte
 	err := s.db.QueryRow(
-		"SELECT der FROM certs WHERE subject_name_der = ? ORDER BY is_self_signed DESC LIMIT 1", subjectNameDER,
+		"SELECT der FROM certs WHERE subject_name_der = ? AND "+poolCond+" ORDER BY is_self_signed DESC LIMIT 1", subjectNameDER,
 	).Scan(&der)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -265,13 +353,13 @@ func (s *Store) FindCertByNameDER(subjectNameDER []byte) ([]byte, error) {
 	return der, err
 }
 
-// FindAllCertsByNameDER returns up to limit certs with the subject, trusted first.
+// FindAllCertsByNameDER returns up to limit pool certs with the subject, trusted first.
 func (s *Store) FindAllCertsByNameDER(subjectNameDER []byte, limit int) ([][]byte, error) {
 	if len(subjectNameDER) == 0 {
 		return nil, nil
 	}
 	rows, err := s.db.Query(
-		"SELECT der FROM certs WHERE subject_name_der = ? ORDER BY trusted DESC, id LIMIT ?",
+		"SELECT der FROM certs WHERE subject_name_der = ? AND "+poolCond+" ORDER BY trusted DESC, id LIMIT ?",
 		subjectNameDER, limit,
 	)
 	if err != nil {
@@ -293,7 +381,7 @@ func (s *Store) FindAllCertsByNameDER(subjectNameDER []byte, limit int) ([][]byt
 func (s *Store) FindCertBySubject(subject string) ([]byte, error) {
 	var der []byte
 	err := s.db.QueryRow(
-		"SELECT der FROM certs WHERE subject = ? ORDER BY is_self_signed DESC LIMIT 1", subject,
+		"SELECT der FROM certs WHERE subject = ? AND "+poolCond+" ORDER BY is_self_signed DESC LIMIT 1", subject,
 	).Scan(&der)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -333,7 +421,7 @@ func (s *Store) FindCertByThumbprint(sha1Hex string) ([]byte, error) {
 func (s *Store) FreshCRLSize(url string) (int, error) {
 	var n int
 	err := s.db.QueryRow(
-		"SELECT length(der) FROM crls WHERE url = ? AND next_update > ?",
+		"SELECT length(c.der) FROM crl_urls u JOIN crls c ON c.sha256 = u.sha256 WHERE u.url = ? AND c.next_update > ?",
 		url, time.Now().Unix(),
 	).Scan(&n)
 	if err == sql.ErrNoRows {
@@ -345,7 +433,7 @@ func (s *Store) FreshCRLSize(url string) (int, error) {
 func (s *Store) FindFreshCRL(url string) ([]byte, error) {
 	var der []byte
 	err := s.db.QueryRow(
-		"SELECT der FROM crls WHERE url = ? AND next_update > ?",
+		"SELECT c.der FROM crl_urls u JOIN crls c ON c.sha256 = u.sha256 WHERE u.url = ? AND c.next_update > ?",
 		url, time.Now().Unix(),
 	).Scan(&der)
 	if err == sql.ErrNoRows {
@@ -371,34 +459,44 @@ func (s *Store) FindFreshCRLByIssuer(issuer string) ([]byte, error) {
 	return der, err
 }
 
-// SaveCRL stores the CRL and drops expired ones.
+// SaveCRL stores the CRL once per content, maps url (if any) to it, and
+// drops expired CRLs.
 func (s *Store) SaveCRL(issuer, url string, der []byte, thisUpdate, nextUpdate time.Time) error {
-	if _, err := s.db.Exec("DELETE FROM crls WHERE next_update < ?", time.Now().Unix()); err != nil {
+	for _, stmt := range []string{
+		"DELETE FROM crls WHERE next_update < ?",
+		"DELETE FROM crl_urls WHERE sha256 NOT IN (SELECT sha256 FROM crls WHERE next_update >= ?)",
+	} {
+		if _, err := s.db.Exec(stmt, time.Now().Unix()); err != nil {
+			return err
+		}
+	}
+	sha := SHA256Hex(der)
+	if _, err := s.db.Exec(`
+		INSERT OR IGNORE INTO crls
+			(issuer, sha256, der, this_update, next_update, created_at)
+		VALUES (?, ?, ?, ?, ?, ?)`,
+		issuer, sha, der, thisUpdate.Unix(), nextUpdate.Unix(), time.Now().Unix(),
+	); err != nil {
 		return err
 	}
 	if url == "" {
-		// Generate stable synthetic URL for uploaded CRLs (one per issuer+next_update)
-		url = fmt.Sprintf("upload://%s|%d", issuer, nextUpdate.Unix())
+		return nil
 	}
-	_, err := s.db.Exec(`
-		INSERT OR REPLACE INTO crls
-			(issuer, url, sha256, der, this_update, next_update, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		issuer, url, SHA256Hex(der), der,
-		thisUpdate.Unix(), nextUpdate.Unix(),
-		time.Now().Unix(),
-	)
+	_, err := s.db.Exec("INSERT OR REPLACE INTO crl_urls (url, sha256) VALUES (?, ?)", url, sha)
 	return err
 }
 
 // ImportTrustedCert trusts a bundled cert unless it was already imported from
 // the same source; reports whether it was added or newly trusted.
 func (s *Store) ImportTrustedCert(subject, issuer, serial, ski, aki string, subjectNameDER, der []byte, isCA, isSelfSigned bool, sourceURL string) (bool, error) {
+	if _, err := s.db.Exec("UPDATE certs SET bundled = 1 WHERE sha256 = ?", SHA256Hex(der)); err != nil {
+		return false, err
+	}
 	res, err := s.db.Exec(`
 		INSERT INTO certs
-			(subject, issuer, serial, ski, aki, subject_name_der, trusted, thumbprint_sha1, sha256, der,
+			(subject, issuer, serial, ski, aki, subject_name_der, trusted, bundled, thumbprint_sha1, sha256, der,
 			 is_ca, is_self_signed, source_url, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(sha256) DO UPDATE SET trusted = 1, source_url = excluded.source_url
 		WHERE certs.source_url IS NOT excluded.source_url`,
 		subject, issuer, serial, ski, aki, subjectNameDER, sha1hex(der), SHA256Hex(der), der,
@@ -410,6 +508,20 @@ func (s *Store) ImportTrustedCert(subject, issuer, serial, ski, aki string, subj
 	}
 	n, err := res.RowsAffected()
 	return n > 0, err
+}
+
+// SaveBundledCert stores a bundled intermediate as a candidate issuer.
+func (s *Store) SaveBundledCert(subject, issuer, serial, ski, aki string, subjectNameDER, der []byte, isCA, isSelfSigned bool, sourceURL string) error {
+	_, err := s.db.Exec(`
+		INSERT INTO certs
+			(subject, issuer, serial, ski, aki, subject_name_der, bundled, thumbprint_sha1, sha256, der,
+			 is_ca, is_self_signed, source_url, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(sha256) DO UPDATE SET bundled = 1`,
+		subject, issuer, serial, ski, aki, subjectNameDER, sha1hex(der), SHA256Hex(der), der,
+		btoi(isCA), btoi(isSelfSigned), sourceURL, time.Now().Unix(),
+	)
+	return err
 }
 
 func (s *Store) SetTrusted(sha256Hex string, trusted bool) error {
