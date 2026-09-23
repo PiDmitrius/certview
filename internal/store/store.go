@@ -28,11 +28,11 @@ var derTables = []string{"certs", "crls", "ocsp_responses"}
 
 // A certificate is identified by the SHA-256 of its DER: serials are unique
 // only per issuer, so trust and deduplication never go by serial. Every
-// certificate seen is archived and found only by its exact thumbprint. The
-// pool of candidate issuers (poolCond) is only trusted, bundled or anchored
-// certificates — anchored meaning a CA verified on a path to a trusted root —
-// so nothing an upload, a site or an AIA response supplies can steer other
-// analyses. CRLs are stored once per content, with fetch URLs mapped to it
+// certificate seen is archived. The pool of candidate issuers (poolCond) is
+// only trusted, bundled or anchored certificates — anchored meaning a CA
+// verified on a path to a trusted root. The rest of the archive offers issuers
+// only as a last resort (FindArchiveIssuers), a bounded sample of the oldest
+// and newest matches, and never affects trust. CRLs are stored once per content, with fetch URLs mapped to it
 // in crl_urls.
 const certsDDL = `CREATE TABLE IF NOT EXISTS %s (
 	id               INTEGER PRIMARY KEY,
@@ -518,6 +518,37 @@ func (s *Store) ImportTrustedCert(subject, issuer, serial, ski, aki string, subj
 	}
 	n, err := res.RowsAffected()
 	return n > 0, err
+}
+
+// FindArchiveIssuers returns up to n oldest and n newest archived
+// certificates with the subject and, unless ski is empty, the SKI.
+func (s *Store) FindArchiveIssuers(ski string, subjectNameDER []byte, n int) ([][]byte, error) {
+	seen := map[int64]bool{}
+	var out [][]byte
+	for _, order := range []string{"ASC", "DESC"} {
+		rows, err := s.db.Query("SELECT id, der FROM certs WHERE subject_name_der = ? AND (? = '' OR ski = ?) ORDER BY id "+order+" LIMIT ?",
+			subjectNameDER, ski, ski, n)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var id int64
+			var der []byte
+			if err := rows.Scan(&id, &der); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			if !seen[id] {
+				seen[id] = true
+				out = append(out, der)
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }
 
 // AnchorCert stores a CA verified on a path to a trusted root as a candidate

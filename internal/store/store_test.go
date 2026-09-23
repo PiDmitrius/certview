@@ -239,3 +239,34 @@ func TestAnchoredJoinsPoolAndSHA256Lookup(t *testing.T) {
 		t.Fatal("not found by SHA-1 thumbprint")
 	}
 }
+
+func TestArchiveIssuersOldestAndNewest(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "certview.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	for i := 0; i < 10; i++ {
+		der := []byte{byte(i)}
+		if err := s.SaveCert("CN=I", "CN=R", "01", "EE", "", []byte("n"), der, true, false, ""); err != nil {
+			t.Fatal(err)
+		}
+		other := []byte{byte(100 + i)}
+		if err := s.SaveCert("CN=X", "CN=R", "01", "EE", "", []byte("other"), other, true, false, ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.FindArchiveIssuers("EE", []byte("n"), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := [][]byte{{0}, {1}, {9}, {8}}
+	if len(got) != len(want) {
+		t.Fatalf("got %d candidates, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if !bytes.Equal(got[i], want[i]) {
+			t.Fatalf("candidate %d: got %v, want %v", i, got[i], want[i])
+		}
+	}
+}

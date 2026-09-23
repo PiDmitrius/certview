@@ -394,7 +394,9 @@ func (h *handler) analyzeData(ctx context.Context, rl reqLog, data []byte, bag [
 		h.archive(rl, entry.info, entry.source)
 	}
 	for _, c := range aiaBag {
-		h.archive(rl, c.info, c.source)
+		if c.source != "archive" {
+			h.archive(rl, c.info, c.source)
+		}
 	}
 	for _, entry := range chain {
 		c := entry.info
@@ -1014,10 +1016,10 @@ func (h *handler) trusted(c *pki.CertInfo) bool {
 }
 
 // bagCert is a candidate issuer for one analysis only — from the site's TLS
-// chain or the analysis's own AIA responses. Bags are never stored.
+// chain, the analysis's own AIA responses or the archive's last-resort sample.
 type bagCert struct {
 	info   *pki.CertInfo
-	source string // "tls" | "fetched"
+	source string // "tls" | "fetched" | "archive"
 }
 
 func (h *handler) resolveIssuer(ctx context.Context, rl reqLog, cert *pki.CertInfo, resp *analyzeResponse, bag *[]bagCert) (*pki.CertInfo, string) {
@@ -1083,7 +1085,7 @@ func (h *handler) resolveIssuer(ctx context.Context, rl reqLog, cert *pki.CertIn
 	if len(cert.AIAURLs) == 0 {
 		rl.f("  NO AIA URLs")
 		resp.Warnings = append(resp.Warnings, "No AIA URL in: "+cert.Subject)
-		return nil, ""
+		return h.archiveIssuer(rl, cert, resp, bag)
 	}
 
 	for _, url := range usableURLs(cert.AIAURLs, maxAIAURLs) {
@@ -1154,8 +1156,36 @@ func (h *handler) resolveIssuer(ctx context.Context, rl reqLog, cert *pki.CertIn
 		}
 	}
 
-	resp.Warnings = append(resp.Warnings, "Could not fetch issuer for: "+cert.Subject)
-	return nil, ""
+	return h.archiveIssuer(rl, cert, resp, bag)
+}
+
+// archiveIssuer is the last resort: a sample of archived certificates whose
+// subject is cert's issuer and whose SKI is cert's AKI (when cert has one)
+// joins the bag, and the one currently valid, else the oldest, is taken.
+func (h *handler) archiveIssuer(rl reqLog, cert *pki.CertInfo, resp *analyzeResponse, bag *[]bagCert) (*pki.CertInfo, string) {
+	ders, err := h.store.FindArchiveIssuers(cert.AKI, cert.IssuerNameDER, archiveSample)
+	if err != nil {
+		rl.f("  archive: %v", err)
+	}
+	var pick *pki.CertInfo
+	now := time.Now()
+	for _, der := range ders {
+		info, err := h.ctx.ParseCertInfo(der)
+		if err != nil {
+			continue
+		}
+		*bag = append(*bag, bagCert{info, "archive"})
+		valid := now.After(info.NotBefore) && now.Before(info.NotAfter)
+		if pick == nil || valid && !(now.After(pick.NotBefore) && now.Before(pick.NotAfter)) {
+			pick = info
+		}
+	}
+	if pick == nil {
+		resp.Warnings = append(resp.Warnings, "Could not fetch issuer for: "+cert.Subject)
+		return nil, ""
+	}
+	rl.f("  archive: %d candidate(s), picked %q", len(ders), pick.Subject)
+	return pick, "archive"
 }
 
 // openCRL parses under the CRL memory gate; close releases both.

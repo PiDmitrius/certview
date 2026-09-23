@@ -48,6 +48,7 @@ const (
 	maxOCSPURLs      = 2
 	maxAIACerts      = 32
 	maxAltCandidates = 8
+	archiveSample    = 16
 	maxChainDepth    = 10
 )
 
