@@ -149,13 +149,13 @@ func TestIssuerPoolExcludesUploads(t *testing.T) {
 	if err := s.SaveCert("CN=I", "CN=R", "01", "AB", "", name, []byte("uploaded lookalike"), true, false, ""); err != nil {
 		t.Fatal(err)
 	}
-	if c, _ := s.FindIssuers(name, "AB", 8); len(c) != 1 || c[0].Pool {
+	if c, _ := s.FindIssuers(name, "AB", 8, 8); len(c) != 1 || c[0].Pool {
 		t.Fatalf("uploaded certificate: got %+v, want one non-pool candidate", c)
 	}
 	if err := s.SavePoolCert("CN=I", "CN=R", "02", "AB", "", name, []byte("bundled"), true, false, "ru-gov"); err != nil {
 		t.Fatal(err)
 	}
-	if c, _ := s.FindIssuers(name, "AB", 8); len(c) != 2 || !c[0].Pool || string(c[0].DER) != "bundled" {
+	if c, _ := s.FindIssuers(name, "AB", 8, 8); len(c) != 2 || !c[0].Pool || string(c[0].DER) != "bundled" {
 		t.Fatalf("bundled issuer not first in pool: %+v", c)
 	}
 }
@@ -220,13 +220,13 @@ func TestAnchoredJoinsPoolAndSHA256Lookup(t *testing.T) {
 	if err := s.SaveCert("CN=I", "CN=R", "05", "CD", "", name, der, true, false, "tls"); err != nil {
 		t.Fatal(err)
 	}
-	if c, _ := s.FindIssuers(name, "CD", 8); len(c) != 1 || c[0].Pool {
+	if c, _ := s.FindIssuers(name, "CD", 8, 8); len(c) != 1 || c[0].Pool {
 		t.Fatal("archived certificate in the issuer pool")
 	}
 	if err := s.SavePoolCert("CN=I", "CN=R", "05", "CD", "", name, der, true, false, ""); err != nil {
 		t.Fatal(err)
 	}
-	if c, _ := s.FindIssuers(name, "CD", 8); len(c) != 1 || !c[0].Pool {
+	if c, _ := s.FindIssuers(name, "CD", 8, 8); len(c) != 1 || !c[0].Pool {
 		t.Fatal("anchored CA not in the issuer pool")
 	}
 	if got, _ := s.FindCertByThumbprint(SHA256Hex(der)); !bytes.Equal(got, der) {
@@ -253,7 +253,7 @@ func TestArchiveIssuersOldestAndNewest(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	got, err := s.FindIssuers([]byte("n"), "EE", 2)
+	got, err := s.FindIssuers([]byte("n"), "EE", 2, 2)
 	if err != nil {
 		t.Fatal(err)
 	}

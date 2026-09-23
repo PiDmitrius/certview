@@ -969,12 +969,10 @@ func (h *handler) trustedPath(der []byte, roots, intermediates [][]byte) (string
 
 // poolIssuers returns the pool certificates named nameDER.
 func (h *handler) poolIssuers(nameDER []byte) [][]byte {
-	cands, _ := h.store.FindIssuers(nameDER, "", maxAltCandidates)
-	var ders [][]byte
-	for _, c := range cands {
-		if c.Pool {
-			ders = append(ders, c.DER)
-		}
+	cands, _ := h.store.FindIssuers(nameDER, "", maxAltCandidates, 0)
+	ders := make([][]byte, len(cands))
+	for i, c := range cands {
+		ders[i] = c.DER
 	}
 	return ders
 }
@@ -1043,29 +1041,43 @@ func (h *handler) resolveIssuer(ctx context.Context, rl reqLog, cert *pki.CertIn
 		}
 	}
 
-	// 2. The pool; other archived matches are kept for after AIA
+	// 2. A currently valid pool certificate; an expired one waits until
+	// after AIA, which may serve its renewal, and the archive after that
+	var expired *pki.CertInfo
 	var archived []*pki.CertInfo
-	cands, err := h.store.FindIssuers(cert.IssuerNameDER, cert.AKI, archiveSample)
+	cands, err := h.store.FindIssuers(cert.IssuerNameDER, cert.AKI, maxAltCandidates, archiveSample)
 	if err != nil {
 		rl.f("  store: %v", err)
 	}
+	now := time.Now()
 	for _, c := range cands {
 		info, err := h.ctx.ParseCertInfo(c.DER)
 		if err != nil {
 			continue
 		}
-		if c.Pool {
+		switch {
+		case !c.Pool:
+			archived = append(archived, info)
+		case now.After(info.NotBefore) && now.Before(info.NotAfter):
 			rl.f("  pool: matched %q", info.Subject)
 			return info, "cache"
+		case expired == nil:
+			expired = info
 		}
-		archived = append(archived, info)
+	}
+	fallback := func() (*pki.CertInfo, string) {
+		if expired != nil {
+			rl.f("  pool: matched expired %q", expired.Subject)
+			return expired, "cache"
+		}
+		return h.archiveIssuer(rl, cert, resp, bag, archived)
 	}
 
 	// 3. Fetch via AIA
 	if len(cert.AIAURLs) == 0 {
 		rl.f("  NO AIA URLs")
 		resp.Warnings = append(resp.Warnings, "No AIA URL in: "+cert.Subject)
-		return h.archiveIssuer(rl, cert, resp, bag, archived)
+		return fallback()
 	}
 
 	for _, url := range usableURLs(cert.AIAURLs, maxAIAURLs) {
@@ -1136,7 +1148,7 @@ func (h *handler) resolveIssuer(ctx context.Context, rl reqLog, cert *pki.CertIn
 		}
 	}
 
-	return h.archiveIssuer(rl, cert, resp, bag, archived)
+	return fallback()
 }
 
 // archiveIssuer is the last resort: the archived candidates join the bag,

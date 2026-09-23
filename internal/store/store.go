@@ -151,6 +151,8 @@ func (s *Store) migrate() error {
 		"DROP INDEX IF EXISTS idx_certs_ski",
 		"DROP INDEX IF EXISTS idx_certs_trusted",
 		"CREATE INDEX IF NOT EXISTS idx_certs_subject_name_der ON certs(subject_name_der)",
+		"CREATE INDEX IF NOT EXISTS idx_certs_name_ski ON certs(subject_name_der, ski)",
+		"CREATE INDEX IF NOT EXISTS idx_certs_pool ON certs(subject_name_der, ski) WHERE " + poolCond,
 		"CREATE INDEX IF NOT EXISTS idx_certs_thumbprint_sha1 ON certs(thumbprint_sha1)",
 	} {
 		if _, err := s.db.Exec(stmt); err != nil {
@@ -462,22 +464,28 @@ type Candidate struct {
 }
 
 // FindIssuers returns the certificates whose subject is issuerNameDER and,
-// unless aki is empty, whose SKI is aki: up to n pool matches (self-signed and
-// trusted first), then up to n oldest and n newest other archived matches.
-func (s *Store) FindIssuers(issuerNameDER []byte, aki string, n int) ([]Candidate, error) {
-	const match = "subject_name_der = ? AND (? = '' OR ski = ?) AND "
-	rows, err := s.db.Query(`
-		SELECT id, der, 1 FROM (SELECT id, der FROM certs WHERE `+match+poolCond+`
-			ORDER BY is_self_signed DESC, trusted DESC, id LIMIT ?)
+// unless aki is empty, whose SKI is aki: up to pool pool matches (self-signed
+// and trusted first), then up to archive oldest and archive newest other
+// archived matches. Each branch is an index seek, so its cost does not grow
+// with the number of archived certificates sharing the name.
+func (s *Store) FindIssuers(issuerNameDER []byte, aki string, pool, archive int) ([]Candidate, error) {
+	match, args := "subject_name_der = ?", []any{issuerNameDER}
+	if aki != "" {
+		match, args = match+" AND ski = ?", append(args, aki)
+	}
+	query := `SELECT id, der, 1 FROM (SELECT id, der FROM certs INDEXED BY idx_certs_pool WHERE ` + match + ` AND ` + poolCond + `
+		ORDER BY is_self_signed DESC, trusted DESC, id LIMIT ?)`
+	all := append(append([]any{}, args...), pool)
+	if archive > 0 {
+		for _, order := range []string{"", " DESC"} {
+			query += `
 		UNION ALL
-		SELECT id, der, 0 FROM (SELECT id, der FROM certs WHERE `+match+`NOT `+poolCond+`
-			ORDER BY id LIMIT ?)
-		UNION ALL
-		SELECT id, der, 0 FROM (SELECT id, der FROM certs WHERE `+match+`NOT `+poolCond+`
-			ORDER BY id DESC LIMIT ?)`,
-		issuerNameDER, aki, aki, n,
-		issuerNameDER, aki, aki, n,
-		issuerNameDER, aki, aki, n)
+		SELECT id, der, 0 FROM (SELECT id, der FROM certs WHERE ` + match + ` AND NOT ` + poolCond + `
+			ORDER BY id` + order + ` LIMIT ?)`
+			all = append(append(all, args...), archive)
+		}
+	}
+	rows, err := s.db.Query(query, all...)
 	if err != nil {
 		return nil, err
 	}
